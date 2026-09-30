@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Проверка анкеты</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="hero">
+        <p class="eyebrow">Survey QA</p>
+        <h1>Проверка запрограммированной анкеты</h1>
+        <p class="lead">Загрузите Word-анкету и вставьте тестовую ссылку. Сервис сравнит вопросы, варианты и ветвления.</p>
+      </header>
+
+      <section class="panel" id="form-panel">
+        <form id="audit-form">
+          <label class="field">
+            <span>Анкета Word</span>
+            <input id="document" name="document" type="file" accept=".docx" required />
+            <small>Файл используется только во время проверки и затем удаляется.</small>
+          </label>
+          <label class="field">
+            <span>Тестовая ссылка</span>
+            <input id="survey-url" name="survey_url" type="url" placeholder="https://..." required />
+            <small>Поддерживаются тестовые ссылки EnjoySurvey и SurveyStudio.</small>
+          </label>
+          <label class="check">
+            <input name="run_logic" type="checkbox" checked />
+            <span>Проверять ветвления несколькими прохождениями</span>
+          </label>
+          <label class="check">
+            <input name="allow_platform_demographics" type="checkbox" checked />
+            <span>В ссылке есть стандартные соц-дем вопросы платформы</span>
+          </label>
+          <small class="hint">Если отмечено, стандартные вопросы о стране, городе/населённом пункте, поле и возрасте не считаются лишними, даже если их нет в Word.</small>
+          <button class="primary" type="submit">Начать проверку</button>
+        </form>
+      </section>
+
+      <section class="panel hidden" id="progress-panel" aria-live="polite">
+        <div class="progress-head">
+          <div>
+            <p class="eyebrow">Выполняется</p>
+            <h2 id="stage">Подготовка</h2>
+          </div>
+          <div class="spinner" aria-hidden="true"></div>
+        </div>
+        <p>Можно оставить страницу открытой. Для сложной анкеты потребуется несколько минут.</p>
+      </section>
+
+      <section class="hidden" id="result-panel" aria-live="polite">
+        <div class="summary" id="summary"></div>
+        <div class="panel">
+          <div class="result-head">
+            <div>
+              <p class="eyebrow">Результат</p>
+              <h2>Найденные расхождения</h2>
+            </div>
+            <a class="secondary" id="download" href="#">Скачать JSON</a>
+          </div>
+          <div id="issues"></div>
+        </div>
+        <div class="panel hidden" id="warnings-panel">
+          <h2>Предупреждения разбора</h2>
+          <ul id="warnings"></ul>
+        </div>
+      </section>
+
+      <section class="panel error hidden" id="error-panel" aria-live="assertive">
+        <h2>Проверка не выполнена</h2>
+        <p id="error-text"></p>
+      </section>
+    </main>
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>

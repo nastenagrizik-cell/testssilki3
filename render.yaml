@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: survey-qa
+    runtime: docker
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: APP_ACCESS_USERNAME
+        value: "surveyqa"
+      - key: APP_ACCESS_PASSWORD
+        sync: false
+      - key: MAX_UPLOAD_MB
+        value: "20"
+      - key: MAX_CONCURRENT_AUDITS
+        value: "1"
+      - key: MAX_LOGIC_SCENARIOS
+        value: "80"
