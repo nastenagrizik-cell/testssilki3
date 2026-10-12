@@ -36,20 +36,66 @@ LEAF_QUESTION_SELECTOR = (
 
 EXTRACT_QUESTIONS_JS = r"""
 () => {
-const payloads = Array.from(document.querySelectorAll('.question-container[data-question-id]'))
-  .filter(q => !q.querySelector('.question-container[data-question-id]'))
+const leaves = Array.from(document.querySelectorAll('.question-container[data-question-id]'))
+  .filter(q => !q.querySelector('.question-container[data-question-id]'));
+const textFieldSelector = [
+  'textarea',
+  'input:not([type])',
+  'input[type="text"]',
+  'input[type="number"]',
+  'input[type="range"]',
+  '[contenteditable="true"]'
+].join(', ');
+const responseSelector = [
+  '[data-value-code]',
+  '.es__answers-row',
+  '.grid-row-tr.row-is-simple',
+  'select',
+  textFieldSelector
+].join(', ');
+const ownTitle = q => {
+  const nodes = Array.from(q.querySelectorAll('[data-testid="header-title"], .question-header'));
+  const node = nodes.find(item => ((item.innerText || item.textContent || '').trim()));
+  return ((node && (node.innerText || node.textContent)) || '').trim();
+};
+const mergedPromptById = new Map();
+const suppressedPromptIds = new Set();
+
+// Some Enjoy groups split one respondent question into two leaf components:
+// the first contains the concept image + wording, the second contains only
+// the open input.  Join those siblings into the response component.
+for (const responseLeaf of leaves) {
+  if (!responseLeaf.querySelector(responseSelector) || ownTitle(responseLeaf)) continue;
+  const parent = responseLeaf.parentElement && responseLeaf.parentElement.closest(
+    '.question-container[data-question-id]'
+  );
+  if (!parent) continue;
+  const promptLeaf = leaves.find(candidate => {
+    if (candidate === responseLeaf || !parent.contains(candidate)) return false;
+    const candidateParent = candidate.parentElement && candidate.parentElement.closest(
+      '.question-container[data-question-id]'
+    );
+    return candidateParent === parent
+      && !candidate.querySelector(responseSelector)
+      && Boolean(ownTitle(candidate));
+  });
+  if (!promptLeaf) continue;
+  const responseId = responseLeaf.getAttribute('data-question-id') || '';
+  const promptId = promptLeaf.getAttribute('data-question-id') || '';
+  mergedPromptById.set(responseId, ownTitle(promptLeaf));
+  if (promptId) suppressedPromptIds.add(promptId);
+}
+
+const payloads = leaves
   .map((q, index) => {
   const classes = Array.from(q.classList);
   const domRawType = classes.find(name => name.startsWith('type_')) || null;
-  const hasTextField = Boolean(q.querySelector(
-    'textarea, input[type="text"], input[type="number"], input[type="range"]'
-  ));
+  const hasTextField = Boolean(q.querySelector(textFieldSelector));
   // EnjoySurvey can wrap an open answer in an image/info component.  The
   // response control is a more reliable type signal than the wrapper class.
   const rawType = domRawType === 'type_info' && hasTextField ? 'type_text' : domRawType;
-  const titleNodes = Array.from(q.querySelectorAll('[data-testid="header-title"], .question-header'));
-  const titleNode = titleNodes.find(node => ((node.innerText || node.textContent || '').trim()));
-  const rawTitle = ((titleNode && (titleNode.innerText || titleNode.textContent)) || '').trim();
+  const platformId = q.getAttribute('data-question-id') || q.id || String(index);
+  const rawTitle = ownTitle(q) || mergedPromptById.get(platformId) || '';
   const titleText = rawTitle.split(/\\n+/).map(line => line.trim()).filter(line =>
     line && !/^(Выберите|Оцените|Ответьте|Укажите минимум|Укажите не более)/i.test(line)
   ).join(' ');
@@ -79,7 +125,7 @@ const payloads = Array.from(document.querySelectorAll('.question-container[data-
   }).filter(row => row.text);
   const row_order = matrix_rows.map(row => row.code);
   return {
-    platform_id: q.getAttribute('data-question-id') || q.id || String(index),
+    platform_id: platformId,
     reference_code: ((rawTitle.match(/^([A-Za-zА-Яа-яЁё]{1,5}\d+(?:[._]\d+|[A-Za-zА-Яа-яЁё]+)*)/) || [])[1] || null),
     text: titleText,
     raw_type: rawType,
@@ -95,11 +141,14 @@ const payloads = Array.from(document.querySelectorAll('.question-container[data-
 // standalone questionnaire questions.  Keeping them created false INFO
 // matches for conditional open questions Q2/Q3.
 return payloads.filter(payload => !(
-  payload.dom_raw_type === 'type_info'
-  && !payload.text
-  && !payload.has_text_field
-  && !payload.options.length
-  && !payload.matrix_rows.length
+  suppressedPromptIds.has(payload.platform_id)
+  || (
+    payload.dom_raw_type === 'type_info'
+    && !payload.text
+    && !payload.has_text_field
+    && !payload.options.length
+    && !payload.matrix_rows.length
+  )
 ));
 }
 """
@@ -377,7 +426,9 @@ class EnjoySurveyAdapter(PlatformAdapter):
             return
 
         text_fields = container.locator(
-            'textarea:visible, input[type="text"]:visible, input[type="number"]:visible, input[type="range"]:visible'
+            'textarea:visible, input:not([type]):visible, input[type="text"]:visible, '
+            'input[type="number"]:visible, input[type="range"]:visible, '
+            '[contenteditable="true"]:visible'
         )
         for index in range(await text_fields.count()):
             field = text_fields.nth(index)
@@ -484,6 +535,11 @@ class EnjoySurveyAdapter(PlatformAdapter):
                         break
                     current_ids: list[str] = []
                     screen_payloads = await page.evaluate(EXTRACT_QUESTIONS_JS)
+                    payloads_by_id = {
+                        str(payload.get("platform_id", "")): payload
+                        for payload in screen_payloads
+                        if payload.get("platform_id")
+                    }
                     for payload in screen_payloads:
                         platform_id = str(payload.get("platform_id", ""))
                         if platform_id and not any(item.platform_id == platform_id for item in observed_questions):
@@ -496,13 +552,16 @@ class EnjoySurveyAdapter(PlatformAdapter):
                             visited_platform.append(platform_id)
                         expected_id = platform_to_expected.get(platform_id)
                         if not expected_id and scenario.expected_texts:
-                            title_nodes = container.locator('[data-testid="header-title"], .question-header')
-                            title = ""
-                            for title_index in range(await title_nodes.count()):
-                                candidate = (await title_nodes.nth(title_index).inner_text()).strip()
-                                if candidate:
-                                    title = candidate
-                                    break
+                            # EXTRACT_QUESTIONS_JS may have joined the wording
+                            # from an INFO/image sibling with this open input.
+                            title = str(payloads_by_id.get(platform_id, {}).get("text", "")).strip()
+                            if not title:
+                                title_nodes = container.locator('[data-testid="header-title"], .question-header')
+                                for title_index in range(await title_nodes.count()):
+                                    candidate = (await title_nodes.nth(title_index).inner_text()).strip()
+                                    if candidate:
+                                        title = candidate
+                                        break
                             if not title:
                                 title = (await container.inner_text()).split("\n", 1)[0].strip()
                             ranked = sorted(
