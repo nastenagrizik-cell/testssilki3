@@ -11,6 +11,7 @@ from .models import (
     ObservedQuestion,
     ObservedSurvey,
     QuestionMatch,
+    ScenarioResult,
     SurveySpec,
 )
 from .normalization import text_similarity
@@ -100,6 +101,74 @@ def _build_answer_code_map(
                 if ranked and ranked[0][0] >= 0.45:
                     result.setdefault(atom.question_id, {})[word_code] = ranked[0][1].code
     return result
+
+
+def _same_platform_question(existing_id: str, runtime_id: str) -> bool:
+    return existing_id.split("@", 1)[0] == runtime_id.split("@", 1)[0]
+
+
+def _merge_scenario_observations(
+    observed: ObservedSurvey,
+    scenario_results: list[ScenarioResult],
+) -> bool:
+    """Merge filtered questions at their runtime position between known anchors."""
+    changed = False
+    for result in scenario_results:
+        runtime_questions = result.observed_questions
+        for runtime_index, detail in enumerate(runtime_questions):
+            candidates = [
+                (index, question)
+                for index, question in enumerate(observed.questions)
+                if _same_platform_question(question.platform_id, detail.platform_id)
+            ]
+            if candidates:
+                index, current = max(
+                    candidates,
+                    key=lambda item: text_similarity(item[1].text, detail.text),
+                )
+                detail.position = current.position
+                observed.questions[index] = detail
+                changed = True
+                continue
+
+            previous_index = None
+            for previous in reversed(runtime_questions[:runtime_index]):
+                previous_index = next(
+                    (
+                        index
+                        for index, question in enumerate(observed.questions)
+                        if _same_platform_question(question.platform_id, previous.platform_id)
+                    ),
+                    None,
+                )
+                if previous_index is not None:
+                    break
+            next_index = None
+            for following in runtime_questions[runtime_index + 1:]:
+                next_index = next(
+                    (
+                        index
+                        for index, question in enumerate(observed.questions)
+                        if _same_platform_question(question.platform_id, following.platform_id)
+                    ),
+                    None,
+                )
+                if next_index is not None:
+                    break
+
+            if next_index is not None:
+                insert_at = next_index
+            elif previous_index is not None:
+                insert_at = previous_index + 1
+            else:
+                insert_at = len(observed.questions)
+            observed.questions.insert(insert_at, detail)
+            changed = True
+
+    if changed:
+        for position, question in enumerate(observed.questions):
+            question.position = position
+    return changed
 
 
 async def run_audit(
@@ -193,28 +262,7 @@ async def run_audit(
                             },
                         )
                     )
-        observed_during_scenarios = [
-            question
-            for result in report.scenario_results
-            for question in result.observed_questions
-        ]
-        if observed_during_scenarios:
-            for detail in observed_during_scenarios:
-                candidates = [
-                    (index, question)
-                    for index, question in enumerate(observed.questions)
-                    if question.platform_id.split("@", 1)[0] == detail.platform_id
-                ]
-                if not candidates:
-                    detail.position = len(observed.questions)
-                    observed.questions.append(detail)
-                    continue
-                index, current = max(
-                    candidates,
-                    key=lambda item: text_similarity(item[1].text, detail.text),
-                )
-                detail.position = current.position
-                observed.questions[index] = detail
+        if _merge_scenario_observations(observed, report.scenario_results):
             runtime_issues = [issue for issue in report.issues if issue.code in runtime_issue_codes]
             refreshed = compare_surveys(
                 spec,
