@@ -62,14 +62,23 @@ def _scenario(
 
 def _baseline_assignments(spec: SurveySpec) -> dict[str, list[str]]:
     baseline: dict[str, list[str]] = {}
+    known_question_ids = {question.id for question in spec.questions}
     # First select every explicitly qualifying "continue" answer.  Screening
     # terminate rules are evaluated afterwards and must not overwrite an
     # already safe value for the same question.
     for rule in spec.rules:
-        if rule.action == "continue" and rule.condition:
+        if (
+            rule.action == "continue"
+            and rule.condition
+            and all(atom.question_id in known_question_ids for atom in rule.condition.atoms)
+        ):
             _apply_condition(baseline, rule, True)
     for rule in spec.rules:
-        if rule.action == "terminate" and rule.condition:
+        if (
+            rule.action == "terminate"
+            and rule.condition
+            and all(atom.question_id in known_question_ids for atom in rule.condition.atoms)
+        ):
             assigned_questions = set(baseline)
             rule_questions = {atom.question_id for atom in rule.condition.atoms}
             if assigned_questions & rule_questions:
