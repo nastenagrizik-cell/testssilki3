@@ -35,11 +35,18 @@ LEAF_QUESTION_SELECTOR = (
 
 
 EXTRACT_QUESTIONS_JS = r"""
-() => Array.from(document.querySelectorAll('.question-container[data-question-id]'))
+() => {
+const payloads = Array.from(document.querySelectorAll('.question-container[data-question-id]'))
   .filter(q => !q.querySelector('.question-container[data-question-id]'))
   .map((q, index) => {
   const classes = Array.from(q.classList);
-  const rawType = classes.find(name => name.startsWith('type_')) || null;
+  const domRawType = classes.find(name => name.startsWith('type_')) || null;
+  const hasTextField = Boolean(q.querySelector(
+    'textarea, input[type="text"], input[type="number"], input[type="range"]'
+  ));
+  // EnjoySurvey can wrap an open answer in an image/info component.  The
+  // response control is a more reliable type signal than the wrapper class.
+  const rawType = domRawType === 'type_info' && hasTextField ? 'type_text' : domRawType;
   const titleNodes = Array.from(q.querySelectorAll('[data-testid="header-title"], .question-header'));
   const titleNode = titleNodes.find(node => ((node.innerText || node.textContent || '').trim()));
   const rawTitle = ((titleNode && (titleNode.innerText || titleNode.textContent)) || '').trim();
@@ -80,8 +87,21 @@ EXTRACT_QUESTIONS_JS = r"""
     rows,
     matrix_rows,
     row_order,
+    has_text_field: hasTextField,
+    dom_raw_type: domRawType,
   };
-})
+});
+// Empty image-only children are demonstrations inside a question group, not
+// standalone questionnaire questions.  Keeping them created false INFO
+// matches for conditional open questions Q2/Q3.
+return payloads.filter(payload => !(
+  payload.dom_raw_type === 'type_info'
+  && !payload.text
+  && !payload.has_text_field
+  && !payload.options.length
+  && !payload.matrix_rows.length
+));
+}
 """
 
 
@@ -221,11 +241,21 @@ class EnjoySurveyAdapter(PlatformAdapter):
                         # short settle delay prevents reading the intermediate
                         # empty/partial phase after the first mutation.
                         await page.wait_for_timeout(400)
+                        selected_value = await fast_move.input_value()
+                        # A filtered fast-move item does not open its screen:
+                        # Enjoy silently jumps to the next available question.
+                        # Sort by the screen that actually opened, otherwise
+                        # Q2/Q3 aliases corrupt the detected questionnaire order.
+                        actual_option_index = direct_positions.get(
+                            str(selected_value), option_index
+                        )
                         payloads = await page.evaluate(EXTRACT_QUESTIONS_JS)
                         for payload_index, payload in enumerate(payloads):
                             platform_id = str(payload.get("platform_id", ""))
                             if platform_id:
-                                sort_keys.setdefault(platform_id, (option_index, payload_index))
+                                sort_keys.setdefault(
+                                    platform_id, (actual_option_index, payload_index)
+                                )
                             if platform_id and platform_id not in seen:
                                 seen.add(platform_id)
                                 payloads_by_id[platform_id] = payload
@@ -411,11 +441,28 @@ class EnjoySurveyAdapter(PlatformAdapter):
                         "options => options.map(option => ({value: option.value, disabled: option.disabled})).filter(option => option.value && !option.disabled)"
                     )
                     if start_candidates:
-                        start_id = str(start_candidates[0]["value"])
+                        available_start_ids = {
+                            str(candidate["value"]) for candidate in start_candidates
+                        }
+                        matched_starts = [
+                            match
+                            for match in sorted(matches, key=lambda item: item.expected_position)
+                            if match.observed_id in available_start_ids
+                        ]
+                        # Start at the first Word question (normally S1), not
+                        # at Enjoy's automatic country/sex/age questions.  A
+                        # random default in those panel questions can screen
+                        # the synthetic respondent out before Q1/Q2/Q3.
+                        start_id = (
+                            matched_starts[0].observed_id
+                            if matched_starts
+                            else str(start_candidates[0]["value"])
+                        )
                         before_start = await page.locator(LEAF_QUESTION_SELECTOR).evaluate_all(
                             "els => els.map(q => q.getAttribute('data-question-id')).join('|')"
                         )
-                        await fast_move.select_option(start_id)
+                        if await fast_move.input_value() != start_id:
+                            await fast_move.select_option(start_id)
                         try:
                             await page.wait_for_function(
                                 "before => Array.from(document.querySelectorAll('.question-container[data-question-id]')).filter(q => !q.querySelector('.question-container[data-question-id]')).map(q => q.getAttribute('data-question-id')).join('|') !== before",
@@ -428,7 +475,12 @@ class EnjoySurveyAdapter(PlatformAdapter):
                 for _ in range(180):
                     containers = page.locator(LEAF_QUESTION_SELECTOR)
                     if not await containers.count():
-                        completed = True
+                        if "status=2" in page.url:
+                            warnings.append(
+                                "Опрос завершил респондента по скринингу до проверки целевой ветки."
+                            )
+                        else:
+                            completed = True
                         break
                     current_ids: list[str] = []
                     screen_payloads = await page.evaluate(EXTRACT_QUESTIONS_JS)
@@ -472,7 +524,12 @@ class EnjoySurveyAdapter(PlatformAdapter):
                         )
                     next_button = page.locator('#nextSurvey, [data-testid="next"], button:has-text("Вперед"), button:has-text("Далее")').first
                     if not await next_button.count() or not await next_button.is_visible():
-                        completed = True
+                        if "status=2" in page.url:
+                            warnings.append(
+                                "Опрос завершил респондента по скринингу до проверки целевой ветки."
+                            )
+                        else:
+                            completed = True
                         break
                     before = await containers.evaluate_all(
                         "els => els.map(q => (q.getAttribute('data-question-id') || '') + ':' + (q.innerText || '')).join('|')"
@@ -495,6 +552,11 @@ class EnjoySurveyAdapter(PlatformAdapter):
                                 timeout=min(self.timeout_ms, 4_000),
                             )
                         except Exception:
+                            if "status=2" in page.url:
+                                warnings.append(
+                                    "Опрос завершил респондента по скринингу до проверки целевой ветки."
+                                )
+                                break
                             if "enjoysurvey" not in page.url:
                                 completed = True
                                 break
@@ -502,9 +564,36 @@ class EnjoySurveyAdapter(PlatformAdapter):
                         await page.wait_for_timeout(300)
                     except Exception:
                         if not await page.locator(LEAF_QUESTION_SELECTOR).count():
-                            completed = True
+                            if "status=2" in page.url:
+                                warnings.append(
+                                    "Опрос завершил респондента по скринингу до проверки целевой ветки."
+                                )
+                            else:
+                                completed = True
                             break
-                        warnings.append("Экран не изменился после нажатия «Далее».")
+                        validation_messages = await page.locator(
+                            '.invalid-feedback:visible, .has-error:visible, '
+                            '.alert-danger:visible, [role="alert"]:visible'
+                        ).all_inner_texts()
+                        validation_text = " ".join(
+                            dict.fromkeys(
+                                text.strip() for text in validation_messages if text.strip()
+                            )
+                        )
+                        current_expected = [
+                            platform_to_expected.get(platform_id, platform_id)
+                            for platform_id in current_ids
+                        ]
+                        if validation_text:
+                            warnings.append(
+                                "Платформа не приняла ответ на экране "
+                                f"{', '.join(current_expected)}: {validation_text}"
+                            )
+                        else:
+                            warnings.append(
+                                "После нажатия «Далее» остался тот же экран "
+                                f"({', '.join(current_expected)}); ответ не был принят платформой."
+                            )
                         break
             except Exception as exc:
                 warnings.append(f"Прохождение остановлено: {type(exc).__name__}: {exc}")
