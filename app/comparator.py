@@ -157,6 +157,15 @@ def _matches_test_product(text: str, products: list[dict[str, str]]) -> bool:
     )
 
 
+def _option_text_key(value: str) -> str:
+    """Normalize cosmetic differences but keep every meaningful word."""
+    without_scale_number = value
+    prefix = re.match(r"^\s*\d+\s*(?:[-–—.]\s*)?(.+)$", value)
+    if prefix and re.search(r"[A-Za-zА-Яа-яЁё]", prefix.group(1)):
+        without_scale_number = prefix.group(1)
+    return normalize_text(without_scale_number)
+
+
 def _compare_options(
     expected: QuestionSpec,
     actual,
@@ -179,8 +188,31 @@ def _compare_options(
             )
         )
         return
+    unmatched_expected = set(range(len(expected.options)))
     unmatched_actual = set(range(len(actual.options)))
-    for expected_option in expected.options:
+    pairs: list[tuple[int, int]] = []
+
+    # Lock all exact wording matches before fuzzy matching.  Without this
+    # pass one changed scale label could steal the next correct label and
+    # produce a cascade of mismatch + missing + extra issues.
+    for expected_index, expected_option in enumerate(expected.options):
+        expected_key = _option_text_key(expected_option.text)
+        exact = next(
+            (
+                actual_index
+                for actual_index in sorted(unmatched_actual)
+                if _option_text_key(actual.options[actual_index].text) == expected_key
+            ),
+            None,
+        )
+        if exact is None:
+            continue
+        unmatched_expected.remove(expected_index)
+        unmatched_actual.remove(exact)
+        pairs.append((expected_index, exact))
+
+    for expected_index in list(sorted(unmatched_expected)):
+        expected_option = expected.options[expected_index]
         if _dynamic_option(expected_option.text) and unmatched_actual:
             matching_products = [
                 index
@@ -188,18 +220,29 @@ def _compare_options(
                 if _matches_test_product(actual.options[index].text, test_products or [])
             ]
             if matching_products:
-                unmatched_actual.remove(matching_products[0])
+                actual_index = matching_products[0]
+                unmatched_expected.remove(expected_index)
+                unmatched_actual.remove(actual_index)
                 continue
-        def option_similarity(option) -> float:
-            actual_text = re.sub(r"^\s*\d+\s*[-–—]\s*", "", option.text)
-            expected_text = re.sub(r"^\s*\d+\s*[-–—]\s*", "", expected_option.text)
-            return text_similarity(expected_text, actual_text)
+
+    # If the two lists have equal remaining length, a replacement/typo is
+    # best represented as one wording mismatch at that position, not as a
+    # missing option plus an unrelated extra option.
+    if unmatched_expected and len(unmatched_expected) == len(unmatched_actual):
+        for expected_index, actual_index in zip(
+            sorted(unmatched_expected), sorted(unmatched_actual), strict=True
+        ):
+            pairs.append((expected_index, actual_index))
+        unmatched_expected.clear()
+        unmatched_actual.clear()
+
+    for expected_index in list(sorted(unmatched_expected)):
+        expected_option = expected.options[expected_index]
 
         ranked = sorted(
             (
-                (option_similarity(option), index, option)
-                for index, option in enumerate(actual.options)
-                if index in unmatched_actual
+                (text_similarity(expected_option.text, actual.options[index].text), index)
+                for index in unmatched_actual
             ),
             reverse=True,
         )
@@ -215,20 +258,14 @@ def _compare_options(
                     )
                 )
             continue
-        score, index, actual_option = ranked[0]
-        unmatched_actual.remove(index)
-        if score < 0.86:
-            issues.append(
-                Issue(
-                    code="option_text_mismatch",
-                    severity="minor",
-                    title=f"Отличается формулировка варианта {expected_option.code}",
-                    expected=expected_option.text,
-                    actual=actual_option.text,
-                    question_id=expected.id,
-                    evidence={"similarity": score},
-                )
-            )
+        _, actual_index = ranked[0]
+        unmatched_expected.remove(expected_index)
+        unmatched_actual.remove(actual_index)
+        pairs.append((expected_index, actual_index))
+
+    for expected_index, actual_index in sorted(pairs):
+        expected_option = expected.options[expected_index]
+        actual_option = actual.options[actual_index]
         if (
             expected_option.exclusive
             and not actual_option.exclusive
@@ -242,6 +279,22 @@ def _compare_options(
                     expected=expected_option.text,
                     actual="На платформе нет признака исключающего варианта",
                     question_id=expected.id,
+                )
+            )
+        if _option_text_key(expected_option.text) != _option_text_key(actual_option.text):
+            issues.append(
+                Issue(
+                    code="option_text_mismatch",
+                    severity="minor",
+                    title=f"Отличается формулировка варианта {expected_option.code}",
+                    expected=expected_option.text,
+                    actual=actual_option.text,
+                    question_id=expected.id,
+                    evidence={
+                        "similarity": text_similarity(expected_option.text, actual_option.text),
+                        "expected_position": expected_index + 1,
+                        "actual_position": actual_index + 1,
+                    },
                 )
             )
     for index in sorted(unmatched_actual):
@@ -544,15 +597,45 @@ def compare_surveys(
             _compare_matrix_rows(expected, actual, issues)
             _compare_rotation(expected, actual, issues)
 
-    observed_positions = [match.observed_position for match in matches]
-    if observed_positions != sorted(observed_positions):
+    expected_order = [match.expected_id for match in matches]
+    actual_order = [
+        match.expected_id
+        for match in sorted(matches, key=lambda item: item.observed_position)
+    ]
+    if actual_order != expected_order:
+        prefix = 0
+        while (
+            prefix < len(expected_order)
+            and expected_order[prefix] == actual_order[prefix]
+        ):
+            prefix += 1
+        suffix = 0
+        while (
+            suffix < len(expected_order) - prefix
+            and expected_order[-(suffix + 1)] == actual_order[-(suffix + 1)]
+        ):
+            suffix += 1
+        stop = len(expected_order) - suffix if suffix else len(expected_order)
+        expected_segment = expected_order[prefix:stop]
+        actual_segment = actual_order[prefix:stop]
+
+        def describe_order(values: list[str]) -> str:
+            if len(values) <= 12:
+                return " → ".join(values)
+            return " → ".join(values[:6] + ["…"] + values[-5:])
+
         issues.append(
             Issue(
                 code="question_order_mismatch",
                 severity="major",
                 title="Последовательность вопросов отличается от Word",
-                expected="Порядок вопросов из Word",
-                actual="Порядок вопросов в тестовой ссылке",
+                expected=f"В Word: {describe_order(expected_segment)}",
+                actual=f"В ссылке: {describe_order(actual_segment)}",
+                question_id=expected_segment[0] if expected_segment else None,
+                evidence={
+                    "expected_order": expected_segment,
+                    "actual_order": actual_segment,
+                },
             )
         )
 
