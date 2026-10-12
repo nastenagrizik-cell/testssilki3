@@ -10,10 +10,11 @@ from app.models import (
     QuestionMatch,
     QuestionSpec,
     QuestionType,
+    ScenarioResult,
     SourceLocation,
     SurveySpec,
 )
-from app.pipeline import _build_answer_code_map, adapter_for
+from app.pipeline import _build_answer_code_map, _merge_scenario_observations, adapter_for
 from app.platforms.enjoysurvey import EnjoySurveyAdapter
 from app.platforms.surveystudio import SurveyStudioAdapter
 
@@ -130,6 +131,33 @@ class PipelineTests(unittest.TestCase):
             _build_answer_code_map(spec, observed, matches),
             {"S3": {"5": "internal-42"}},
         )
+
+    def test_filtered_runtime_questions_are_inserted_between_real_anchors(self):
+        observed = ObservedSurvey(
+            platform="EnjoySurvey",
+            source_url="https://example.test",
+            questions=[
+                ObservedQuestion(platform_id="1", text="Q1", position=0),
+                ObservedQuestion(platform_id="4", text="Q4", position=1),
+            ],
+        )
+        runtime = ScenarioResult(
+            scenario_id="route-1",
+            completed=True,
+            observed_questions=[
+                ObservedQuestion(platform_id="1", text="Q1"),
+                ObservedQuestion(platform_id="2", text="Q2", type=QuestionType.TEXT),
+                ObservedQuestion(platform_id="3", text="Q3", type=QuestionType.TEXT),
+                ObservedQuestion(platform_id="4", text="Q4"),
+            ],
+        )
+
+        self.assertTrue(_merge_scenario_observations(observed, [runtime]))
+        self.assertEqual(
+            [question.platform_id for question in observed.questions],
+            ["1", "2", "3", "4"],
+        )
+        self.assertEqual([question.position for question in observed.questions], [0, 1, 2, 3])
 
 
 if __name__ == "__main__":
