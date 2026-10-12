@@ -177,6 +177,48 @@ class ComparatorTests(unittest.TestCase):
 
         self.assertNotIn("option_code_mismatch", codes)
 
+    def test_one_replaced_scale_label_produces_exactly_one_wording_issue(self):
+        labels = [
+            "Совсем не нравится",
+            "Скорее не нравится",
+            "Отчасти нравится, отчасти нет",
+            "Скорее нравится",
+            "Очень нравится",
+        ]
+        expected = expected_question(
+            "Q1",
+            "Насколько Вам нравится?",
+            [AnswerOption(code=str(index), text=text) for index, text in enumerate(labels, 1)],
+        )
+        actual_labels = labels.copy()
+        actual_labels[3] = "Скорее подходит"
+        observed = ObservedSurvey(
+            platform="EnjoySurvey",
+            source_url="https://example.test/survey",
+            questions=[
+                ObservedQuestion(
+                    platform_id="1",
+                    text=expected.text,
+                    type=QuestionType.SINGLE,
+                    options=[
+                        AnswerOption(code=str(index), text=text)
+                        for index, text in enumerate(actual_labels, 1)
+                    ],
+                )
+            ],
+        )
+
+        option_issues = [
+            issue
+            for issue in compare_surveys(SurveySpec(title="Тест", questions=[expected]), observed).issues
+            if issue.code in {"option_text_mismatch", "missing_option", "extra_option"}
+        ]
+
+        self.assertEqual(len(option_issues), 1)
+        self.assertEqual(option_issues[0].code, "option_text_mismatch")
+        self.assertEqual(option_issues[0].expected, "Скорее нравится")
+        self.assertEqual(option_issues[0].actual, "Скорее подходит")
+
     def test_scale_number_prefix_is_not_a_wording_error_but_wrong_label_is(self):
         expected = expected_question(
             "Q1",
@@ -318,6 +360,31 @@ class ComparatorTests(unittest.TestCase):
         report = compare_surveys(SurveySpec(title="Тест", questions=[first, second]), observed)
         matched = {match.expected_id: match.observed_id for match in report.matches}
         self.assertEqual(matched, {"S8": "8", "S9": "9"})
+
+    def test_order_issue_names_the_differing_question_sequence(self):
+        questions = [
+            expected_question("Q1", "Первый вопрос", []),
+            expected_question("Q2", "Второй вопрос", []),
+            expected_question("Q3", "Третий вопрос", []),
+        ]
+        observed = ObservedSurvey(
+            platform="EnjoySurvey",
+            source_url="https://example.test/survey",
+            questions=[
+                ObservedQuestion(platform_id="1", text="Первый вопрос", type=QuestionType.SINGLE),
+                ObservedQuestion(platform_id="3", text="Третий вопрос", type=QuestionType.SINGLE),
+                ObservedQuestion(platform_id="2", text="Второй вопрос", type=QuestionType.SINGLE),
+            ],
+        )
+
+        order_issue = next(
+            issue
+            for issue in compare_surveys(SurveySpec(title="Тест", questions=questions), observed).issues
+            if issue.code == "question_order_mismatch"
+        )
+
+        self.assertEqual(order_issue.expected, "В Word: Q2 → Q3")
+        self.assertEqual(order_issue.actual, "В ссылке: Q3 → Q2")
 
     def test_surveystudio_reference_uses_product_suffix_and_does_not_hide_missing_question(self):
         b18 = expected_question("B18", "Насколько напиток отличается от других?", [])
