@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from .comparator import compare_surveys
 from .docx_parser import DocxSurveyParser
-from .models import ComparisonReport, Issue, ObservedSurvey, QuestionMatch, SurveySpec
+from .models import (
+    ComparisonReport,
+    Issue,
+    ObservedQuestion,
+    ObservedSurvey,
+    QuestionMatch,
+    SurveySpec,
+)
 from .normalization import text_similarity
 from .planner import build_scenarios
 from .platforms import EnjoySurveyAdapter, SurveyStudioAdapter
@@ -30,6 +38,7 @@ def _build_answer_code_map(
     """Translate Word answer codes to platform codes using answer wording."""
     observed_by_id = {question.platform_id: question for question in observed.questions}
     result: dict[str, dict[str, str]] = {}
+    observed_by_expected: dict[str, ObservedQuestion] = {}
     for match in matches:
         if match.expected_position >= len(spec.questions):
             continue
@@ -37,6 +46,7 @@ def _build_answer_code_map(
         actual = observed_by_id.get(match.observed_id)
         if not actual:
             continue
+        observed_by_expected[expected.id] = actual
         available = set(range(len(actual.options)))
         code_map: dict[str, str] = {}
         for expected_option in expected.options:
@@ -54,6 +64,41 @@ def _build_answer_code_map(
             code_map[expected_option.code] = actual.options[index].code
         if code_map:
             result[expected.id] = code_map
+
+    # A routing instruction can still provide the answer wording when its
+    # shared Word answer table was intentionally struck out, for example:
+    # "продолжить, если S3=5 (бургеры с говядиной)".  Enjoy's internal
+    # data-value-code is not guaranteed to equal Word code 5, so map it by
+    # that wording instead of clicking the raw number and screening out.
+    for rule in spec.rules:
+        if not rule.condition:
+            continue
+        for atom in rule.condition.atoms:
+            actual = observed_by_expected.get(atom.question_id)
+            if not actual or not actual.options:
+                continue
+            for word_code in atom.values:
+                if word_code in result.get(atom.question_id, {}):
+                    continue
+                label_match = re.search(
+                    rf"\b{re.escape(atom.question_id)}\s*(?:=|==|:)?\s*"
+                    rf"{re.escape(word_code)}\s*\(([^)]+)\)",
+                    rule.raw_text,
+                    flags=re.I,
+                )
+                if not label_match:
+                    continue
+                label = label_match.group(1).strip()
+                ranked = sorted(
+                    (
+                        (text_similarity(label, option.text), option)
+                        for option in actual.options
+                    ),
+                    key=lambda item: item[0],
+                    reverse=True,
+                )
+                if ranked and ranked[0][0] >= 0.45:
+                    result.setdefault(atom.question_id, {})[word_code] = ranked[0][1].code
     return result
 
 
