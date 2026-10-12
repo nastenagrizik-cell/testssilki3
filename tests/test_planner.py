@@ -58,11 +58,45 @@ class PlannerTests(unittest.TestCase):
             display_rules=[show_rule],
             source=SourceLocation(block_index=2, kind="paragraph"),
         )
+        screening = QuestionSpec(
+            id="S3",
+            text="Скрининг",
+            source=SourceLocation(block_index=1, kind="paragraph"),
+        )
         scenarios = build_scenarios(
-            SurveySpec(title="Тест", questions=[question], rules=[continue_rule, terminate_rule])
+            SurveySpec(
+                title="Тест",
+                questions=[screening, question],
+                rules=[continue_rule, terminate_rule],
+            )
         )
 
         self.assertEqual(scenarios[0].assignments["S3"], ["5"])
+
+    def test_baseline_ignores_rule_for_struck_or_absent_question(self):
+        obsolete_rule = LogicRule(
+            action="terminate",
+            condition=ConditionGroup(atoms=[ConditionAtom(question_id="S4", values=["5"])]),
+            raw_text="Завершить, если S4=5",
+        )
+        show_rule = LogicRule(
+            action="show",
+            target_question_id="Q2",
+            condition=ConditionGroup(atoms=[ConditionAtom(question_id="Q1", values=["3"])]),
+            raw_text="Показать Q2, если Q1=3",
+        )
+        question = QuestionSpec(
+            id="Q2",
+            text="Почему?",
+            display_rules=[show_rule],
+            source=SourceLocation(block_index=2, kind="paragraph"),
+        )
+
+        scenarios = build_scenarios(
+            SurveySpec(title="Тест", questions=[question], rules=[obsolete_rule])
+        )
+
+        self.assertTrue(all("S4" not in scenario.assignments for scenario in scenarios))
 
     def test_checks_every_atom_of_and_condition(self):
         rule = LogicRule(
