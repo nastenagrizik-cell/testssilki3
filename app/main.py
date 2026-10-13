@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 
+from . import __version__
 from .jobs import jobs
 
 
@@ -19,7 +20,7 @@ BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "20")) * 1024 * 1024
 
-app = FastAPI(title="Survey QA", version="0.4.0")
+app = FastAPI(title="Survey QA", version=__version__)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 security = HTTPBasic(auto_error=False)
 
@@ -43,7 +44,7 @@ def require_auth(credentials: HTTPBasicCredentials | None = Depends(security)) -
 
 @app.get("/health")
 async def health() -> dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "version": __version__}
 
 
 @app.get("/", dependencies=[Depends(require_auth)])
