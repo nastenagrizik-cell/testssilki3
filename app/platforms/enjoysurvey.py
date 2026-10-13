@@ -22,6 +22,10 @@ TYPE_MAP = {
     "type_group": QuestionType.SINGLE,
     "type_single": QuestionType.SINGLE,
     "type_text": QuestionType.TEXT,
+    # Enjoy names ordinary open-answer questions `free` in its client model.
+    # They are rendered as a textarea and are not informational screens.
+    "type_free": QuestionType.TEXT,
+    "type_freedict": QuestionType.TEXT,
     "type_number": QuestionType.NUMBER,
     "type_rank": QuestionType.RANKING,
     "type_ranking": QuestionType.RANKING,
@@ -62,28 +66,37 @@ const mergedPromptById = new Map();
 const suppressedPromptIds = new Set();
 
 // Some Enjoy groups split one respondent question into two leaf components:
-// the first contains the concept image + wording, the second contains only
-// the open input.  Join those siblings into the response component.
+// a type_info concept/image and a type_free open answer.  The info component
+// is presentation, not a separate questionnaire question.  Suppress it even
+// when the free component has its own title; borrow its title only when the
+// response component has none.
 for (const responseLeaf of leaves) {
-  if (!responseLeaf.querySelector(responseSelector) || ownTitle(responseLeaf)) continue;
+  if (!responseLeaf.querySelector(responseSelector)) continue;
   const parent = responseLeaf.parentElement && responseLeaf.parentElement.closest(
     '.question-container[data-question-id]'
   );
   if (!parent) continue;
-  const promptLeaf = leaves.find(candidate => {
+  const promptLeaves = leaves.filter(candidate => {
     if (candidate === responseLeaf || !parent.contains(candidate)) return false;
     const candidateParent = candidate.parentElement && candidate.parentElement.closest(
       '.question-container[data-question-id]'
     );
+    const candidateType = Array.from(candidate.classList).find(name => name.startsWith('type_'));
     return candidateParent === parent
+      && candidateType === 'type_info'
       && !candidate.querySelector(responseSelector)
-      && Boolean(ownTitle(candidate));
+      && !candidate.querySelector('[data-value-code], .es__answers-row, .grid-row-tr.row-is-simple');
   });
-  if (!promptLeaf) continue;
+  if (!promptLeaves.length) continue;
   const responseId = responseLeaf.getAttribute('data-question-id') || '';
-  const promptId = promptLeaf.getAttribute('data-question-id') || '';
-  mergedPromptById.set(responseId, ownTitle(promptLeaf));
-  if (promptId) suppressedPromptIds.add(promptId);
+  if (!ownTitle(responseLeaf)) {
+    const promptTitle = promptLeaves.map(ownTitle).find(Boolean);
+    if (promptTitle) mergedPromptById.set(responseId, promptTitle);
+  }
+  for (const promptLeaf of promptLeaves) {
+    const promptId = promptLeaf.getAttribute('data-question-id') || '';
+    if (promptId) suppressedPromptIds.add(promptId);
+  }
 }
 
 const payloads = leaves
@@ -180,6 +193,8 @@ class EnjoySurveyAdapter(PlatformAdapter):
             return QuestionType.MATRIX_SINGLE
         if raw_type in TYPE_MAP:
             return TYPE_MAP[raw_type]
+        if raw_type and raw_type.startswith("type_free"):
+            return QuestionType.TEXT
         if option_count:
             return QuestionType.SINGLE
         return QuestionType.INFO
@@ -433,12 +448,20 @@ class EnjoySurveyAdapter(PlatformAdapter):
         for index in range(await text_fields.count()):
             field = text_fields.nth(index)
             field_type = await field.get_attribute("type")
+            # Enjoy's type_free component sets `freeValue.selected` in the
+            # textarea click handler. `fill()` alone changes the visible value
+            # but does not activate that flag, so the platform rejects Next.
+            await field.click()
             if field_type == "range":
                 minimum = float(await field.get_attribute("min") or 0)
                 maximum = float(await field.get_attribute("max") or 100)
                 await field.fill(str((minimum + maximum) / 2))
             else:
                 await field.fill("1" if field_type == "number" else "Тестовый ответ")
+            # Keep compatibility with controls whose model listens to one of
+            # these native events rather than Playwright's fill event only.
+            await field.dispatch_event("input")
+            await field.dispatch_event("change")
 
         selects = container.locator('select:visible')
         for index in range(await selects.count()):
