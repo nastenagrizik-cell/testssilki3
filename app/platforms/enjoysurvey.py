@@ -36,12 +36,17 @@ TYPE_MAP = {
 LEAF_QUESTION_SELECTOR = (
     '.question-container[data-question-id]:not(:has(.question-container[data-question-id]))'
 )
+VISIBLE_LEAF_QUESTION_SELECTOR = f"{LEAF_QUESTION_SELECTOR}:visible"
 
 
 EXTRACT_QUESTIONS_JS = r"""
 () => {
 const leaves = Array.from(document.querySelectorAll('.question-container[data-question-id]'))
-  .filter(q => !q.querySelector('.question-container[data-question-id]'));
+  .filter(q => !q.querySelector('.question-container[data-question-id]'))
+  .filter(q => {
+    const style = window.getComputedStyle(q);
+    return style.display !== 'none' && style.visibility !== 'hidden' && q.getClientRects().length > 0;
+  });
 const textFieldSelector = [
   'textarea',
   'input:not([type])',
@@ -65,28 +70,38 @@ const ownTitle = q => {
 const mergedPromptById = new Map();
 const suppressedPromptIds = new Set();
 
-// Some Enjoy groups split one respondent question into two leaf components:
+// Some Enjoy screens split one respondent question into two leaf components:
 // a type_info concept/image and a type_free open answer.  The info component
 // is presentation, not a separate questionnaire question.  Suppress it even
 // when the free component has its own title; borrow its title only when the
 // response component has none.
 for (const responseLeaf of leaves) {
-  if (!responseLeaf.querySelector(responseSelector)) continue;
+  if (!responseLeaf.querySelector(textFieldSelector)) continue;
   const parent = responseLeaf.parentElement && responseLeaf.parentElement.closest(
     '.question-container[data-question-id]'
   );
-  if (!parent) continue;
-  const promptLeaves = leaves.filter(candidate => {
-    if (candidate === responseLeaf || !parent.contains(candidate)) return false;
-    const candidateParent = candidate.parentElement && candidate.parentElement.closest(
-      '.question-container[data-question-id]'
-    );
+  let promptLeaves = leaves.filter(candidate => {
+    if (candidate === responseLeaf || !parent || !parent.contains(candidate)) return false;
+    const candidateParent = candidate.parentElement && candidate.parentElement.closest('.question-container[data-question-id]');
     const candidateType = Array.from(candidate.classList).find(name => name.startsWith('type_'));
     return candidateParent === parent
       && candidateType === 'type_info'
       && !candidate.querySelector(responseSelector)
       && !candidate.querySelector('[data-value-code], .es__answers-row, .grid-row-tr.row-is-simple');
   });
+  // In some Enjoy themes the two components have no data-question-id parent.
+  // In that layout the immediately preceding visible INFO leaf is the concept
+  // presentation belonging to this open response.
+  if (!promptLeaves.length) {
+    const responseIndex = leaves.indexOf(responseLeaf);
+    const previous = responseIndex > 0 ? leaves[responseIndex - 1] : null;
+    const previousType = previous
+      ? Array.from(previous.classList).find(name => name.startsWith('type_'))
+      : null;
+    if (previous && previousType === 'type_info' && !previous.querySelector(responseSelector)) {
+      promptLeaves = [previous];
+    }
+  }
   if (!promptLeaves.length) continue;
   const responseId = responseLeaf.getAttribute('data-question-id') || '';
   if (!ownTitle(responseLeaf)) {
@@ -409,6 +424,46 @@ class EnjoySurveyAdapter(PlatformAdapter):
                 clicked += 1
         return clicked
 
+    async def _fill_text_fields(self, scope) -> int:
+        text_fields = scope.locator(
+            'textarea:visible, input:not([type]):visible, input[type="text"]:visible, '
+            'input[type="number"]:visible, input[type="range"]:visible, '
+            '[contenteditable="true"]:visible'
+        )
+        filled = 0
+        for index in range(await text_fields.count()):
+            field = text_fields.nth(index)
+            field_type = await field.get_attribute("type")
+            if await field.get_attribute("contenteditable") == "true":
+                current_value = (await field.text_content() or "").strip()
+            else:
+                current_value = (await field.input_value()).strip()
+            if current_value:
+                continue
+            await field.click()
+            if field_type == "range":
+                minimum = float(await field.get_attribute("min") or 0)
+                maximum = float(await field.get_attribute("max") or 100)
+                value = str((minimum + maximum) / 2)
+            elif field_type == "number":
+                value = "30"
+            else:
+                minimum_length = int(await field.get_attribute("minlength") or 0)
+                maximum_length = int(await field.get_attribute("maxlength") or 0)
+                desired_length = max(28, minimum_length)
+                if maximum_length > 0:
+                    desired_length = min(desired_length, maximum_length)
+                seed = "Тестовый подробный ответ для проверки логики"
+                value = (seed * ((desired_length // len(seed)) + 1))[:desired_length]
+            await field.fill(value)
+            # Enjoy stores the open response in its Svelte model on native
+            # input/change events. Blur finalises masks and inline validation.
+            await field.dispatch_event("input")
+            await field.dispatch_event("change")
+            await field.press("Tab")
+            filled += 1
+        return filled
+
     async def _answer_container(
         self,
         container,
@@ -440,28 +495,7 @@ class EnjoySurveyAdapter(PlatformAdapter):
             await self._click_answer_items(container, selected_codes, minimum=minimum)
             return
 
-        text_fields = container.locator(
-            'textarea:visible, input:not([type]):visible, input[type="text"]:visible, '
-            'input[type="number"]:visible, input[type="range"]:visible, '
-            '[contenteditable="true"]:visible'
-        )
-        for index in range(await text_fields.count()):
-            field = text_fields.nth(index)
-            field_type = await field.get_attribute("type")
-            # Enjoy's type_free component sets `freeValue.selected` in the
-            # textarea click handler. `fill()` alone changes the visible value
-            # but does not activate that flag, so the platform rejects Next.
-            await field.click()
-            if field_type == "range":
-                minimum = float(await field.get_attribute("min") or 0)
-                maximum = float(await field.get_attribute("max") or 100)
-                await field.fill(str((minimum + maximum) / 2))
-            else:
-                await field.fill("1" if field_type == "number" else "Тестовый ответ")
-            # Keep compatibility with controls whose model listens to one of
-            # these native events rather than Playwright's fill event only.
-            await field.dispatch_event("input")
-            await field.dispatch_event("change")
+        await self._fill_text_fields(container)
 
         selects = container.locator('select:visible')
         for index in range(await selects.count()):
@@ -482,11 +516,42 @@ class EnjoySurveyAdapter(PlatformAdapter):
         from playwright.async_api import async_playwright
 
         platform_to_expected = {match.observed_id: match.expected_id for match in matches}
+        expected_position_by_id = {
+            match.expected_id: match.expected_position for match in matches
+        }
+        target_ids = list(dict.fromkeys(scenario.expected_visible + scenario.expected_hidden))
+        target_positions = [
+            expected_position_by_id[target_id]
+            for target_id in target_ids
+            if target_id in expected_position_by_id
+        ]
         visited_platform: list[str] = []
         visited_expected: list[str] = []
         observed_questions: list[ObservedQuestion] = []
         warnings: list[str] = []
         completed = False
+
+        def route_is_proven() -> bool:
+            if any(target in visited_expected for target in scenario.expected_hidden):
+                return False
+            if any(target not in visited_expected for target in scenario.expected_visible):
+                return False
+            if not scenario.expected_hidden:
+                return True
+            hidden_positions = [
+                expected_position_by_id[target]
+                for target in scenario.expected_hidden
+                if target in expected_position_by_id
+            ]
+            if len(hidden_positions) != len(scenario.expected_hidden):
+                return False
+            visited_positions = [
+                expected_position_by_id[target]
+                for target in visited_expected
+                if target in expected_position_by_id
+            ]
+            return bool(visited_positions) and max(visited_positions) > max(hidden_positions)
+
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(**self._launch_options())
             context = await browser.new_context(locale="ru-RU")
@@ -501,7 +566,7 @@ class EnjoySurveyAdapter(PlatformAdapter):
                         "EnjoySurvey перенаправил на страницу входа; тестовая ссылка недоступна"
                     )
                 await page.wait_for_selector(
-                    LEAF_QUESTION_SELECTOR,
+                    VISIBLE_LEAF_QUESTION_SELECTOR,
                     state="attached",
                     timeout=self.timeout_ms,
                 )
@@ -518,28 +583,49 @@ class EnjoySurveyAdapter(PlatformAdapter):
                         available_start_ids = {
                             str(candidate["value"]) for candidate in start_candidates
                         }
+                        assigned_starts = [
+                            match
+                            for match in sorted(matches, key=lambda item: item.expected_position)
+                            if (
+                                match.observed_id in available_start_ids
+                                and match.expected_id in scenario.assignments
+                                and (
+                                    not target_positions
+                                    or match.expected_position < min(target_positions)
+                                )
+                            )
+                        ]
                         matched_starts = [
                             match
                             for match in sorted(matches, key=lambda item: item.expected_position)
                             if match.observed_id in available_start_ids
                         ]
-                        # Start at the first Word question (normally S1), not
-                        # at Enjoy's automatic country/sex/age questions.  A
-                        # random default in those panel questions can screen
-                        # the synthetic respondent out before Q1/Q2/Q3.
+                        # A logic route should start at the nearest controlling
+                        # question (Q1 for Q2/Q3), not traverse the entire
+                        # questionnaire from S1. This both speeds up checks and
+                        # prevents unrelated later validation from making a
+                        # proven branch look inconclusive.
                         start_id = (
-                            matched_starts[0].observed_id
+                            assigned_starts[-1].observed_id
+                            if assigned_starts
+                            else matched_starts[0].observed_id
                             if matched_starts
                             else str(start_candidates[0]["value"])
                         )
-                        before_start = await page.locator(LEAF_QUESTION_SELECTOR).evaluate_all(
+                        before_start = await page.locator(VISIBLE_LEAF_QUESTION_SELECTOR).evaluate_all(
                             "els => els.map(q => q.getAttribute('data-question-id')).join('|')"
                         )
                         if await fast_move.input_value() != start_id:
                             await fast_move.select_option(start_id)
                         try:
                             await page.wait_for_function(
-                                "before => Array.from(document.querySelectorAll('.question-container[data-question-id]')).filter(q => !q.querySelector('.question-container[data-question-id]')).map(q => q.getAttribute('data-question-id')).join('|') !== before",
+                                """before => Array.from(document.querySelectorAll('.question-container[data-question-id]'))
+                                  .filter(q => !q.querySelector('.question-container[data-question-id]'))
+                                  .filter(q => {
+                                    const style = getComputedStyle(q);
+                                    return style.display !== 'none' && style.visibility !== 'hidden' && q.getClientRects().length > 0;
+                                  })
+                                  .map(q => q.getAttribute('data-question-id')).join('|') !== before""",
                                 arg=before_start,
                                 timeout=min(self.timeout_ms, 8_000),
                             )
@@ -547,7 +633,7 @@ class EnjoySurveyAdapter(PlatformAdapter):
                             pass
                         await page.wait_for_timeout(400)
                 for _ in range(180):
-                    containers = page.locator(LEAF_QUESTION_SELECTOR)
+                    containers = page.locator(VISIBLE_LEAF_QUESTION_SELECTOR)
                     if not await containers.count():
                         if "status=2" in page.url:
                             warnings.append(
@@ -604,6 +690,15 @@ class EnjoySurveyAdapter(PlatformAdapter):
                             scenario.assignments,
                             answer_code_map or {},
                         )
+                    # Some themes render the actual textarea next to (rather
+                    # than inside) the data-question-id leaf. Fill any such
+                    # visible response control before submitting the screen.
+                    survey_root = page.locator(".es__root").first
+                    if await survey_root.count():
+                        await self._fill_text_fields(survey_root)
+                    if route_is_proven():
+                        completed = True
+                        break
                     next_button = page.locator('#nextSurvey, [data-testid="next"], button:has-text("Вперед"), button:has-text("Далее")').first
                     if not await next_button.count() or not await next_button.is_visible():
                         if "status=2" in page.url:
@@ -613,13 +708,48 @@ class EnjoySurveyAdapter(PlatformAdapter):
                         else:
                             completed = True
                         break
-                    before = await containers.evaluate_all(
-                        "els => els.map(q => (q.getAttribute('data-question-id') || '') + ':' + (q.innerText || '')).join('|')"
+                    await page.wait_for_timeout(150)
+                    before = await page.evaluate(
+                        """() => JSON.stringify({
+                          url: location.href,
+                          fast: document.querySelector('#fastMoveSelect')?.value || '',
+                          progress: document.querySelector('[role="progressbar"]')?.getAttribute('aria-valuenow') || '',
+                          leaves: Array.from(document.querySelectorAll('.question-container[data-question-id]'))
+                            .filter(q => !q.querySelector('.question-container[data-question-id]'))
+                            .filter(q => {
+                              const style = getComputedStyle(q);
+                              return style.display !== 'none' && style.visibility !== 'hidden' && q.getClientRects().length > 0;
+                            })
+                            .map(q => ({
+                              id: q.getAttribute('data-question-id') || '',
+                              cls: q.className,
+                              text: (q.innerText || '').trim(),
+                              values: Array.from(q.querySelectorAll('textarea, input, [contenteditable="true"]'))
+                                .map(field => field.value ?? field.textContent ?? '')
+                            }))
+                        })"""
                     )
                     await next_button.click()
                     try:
                         await page.wait_for_function(
-                            "before => Array.from(document.querySelectorAll('.question-container[data-question-id]')).filter(q => !q.querySelector('.question-container[data-question-id]')).map(q => (q.getAttribute('data-question-id') || '') + ':' + (q.innerText || '')).join('|') !== before",
+                            """before => JSON.stringify({
+                              url: location.href,
+                              fast: document.querySelector('#fastMoveSelect')?.value || '',
+                              progress: document.querySelector('[role="progressbar"]')?.getAttribute('aria-valuenow') || '',
+                              leaves: Array.from(document.querySelectorAll('.question-container[data-question-id]'))
+                                .filter(q => !q.querySelector('.question-container[data-question-id]'))
+                                .filter(q => {
+                                  const style = getComputedStyle(q);
+                                  return style.display !== 'none' && style.visibility !== 'hidden' && q.getClientRects().length > 0;
+                                })
+                                .map(q => ({
+                                  id: q.getAttribute('data-question-id') || '',
+                                  cls: q.className,
+                                  text: (q.innerText || '').trim(),
+                                  values: Array.from(q.querySelectorAll('textarea, input, [contenteditable="true"]'))
+                                    .map(field => field.value ?? field.textContent ?? '')
+                                }))
+                            }) !== before""",
                             arg=before,
                             timeout=min(self.timeout_ms, 8_000),
                         )
@@ -629,7 +759,7 @@ class EnjoySurveyAdapter(PlatformAdapter):
                         # end of the questionnaire.
                         try:
                             await page.wait_for_selector(
-                                LEAF_QUESTION_SELECTOR,
+                                VISIBLE_LEAF_QUESTION_SELECTOR,
                                 state="attached",
                                 timeout=min(self.timeout_ms, 4_000),
                             )
@@ -645,7 +775,7 @@ class EnjoySurveyAdapter(PlatformAdapter):
                             raise
                         await page.wait_for_timeout(300)
                     except Exception:
-                        if not await page.locator(LEAF_QUESTION_SELECTOR).count():
+                        if not await page.locator(VISIBLE_LEAF_QUESTION_SELECTOR).count():
                             if "status=2" in page.url:
                                 warnings.append(
                                     "Опрос завершил респондента по скринингу до проверки целевой ветки."
@@ -655,7 +785,9 @@ class EnjoySurveyAdapter(PlatformAdapter):
                             break
                         validation_messages = await page.locator(
                             '.invalid-feedback:visible, .has-error:visible, '
-                            '.alert-danger:visible, [role="alert"]:visible'
+                            '.alert-danger:visible, [role="alert"]:visible, '
+                            '.question-error-message:visible, [data-testid="errors"]:visible, '
+                            '.noty_body:visible'
                         ).all_inner_texts()
                         validation_text = " ".join(
                             dict.fromkeys(
