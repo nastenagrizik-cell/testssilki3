@@ -65,14 +65,14 @@ class PipelineTests(unittest.TestCase):
         adapter = adapter_for("https://go.surveystudio.ru/test/token/start")
         self.assertIsInstance(adapter, SurveyStudioAdapter)
 
-    def test_enjoy_info_wrapper_with_open_field_is_converted_to_text(self):
+    def test_enjoy_free_question_is_converted_to_text(self):
         adapter = EnjoySurveyAdapter()
         question = adapter._convert(
             {
                 "platform_id": "102",
                 "text": "Что Вам понравилось?",
-                "raw_type": "type_text",
-                "dom_raw_type": "type_info",
+                "raw_type": "type_free",
+                "dom_raw_type": "type_free",
                 "has_text_field": True,
                 "options": [],
                 "rows": 0,
@@ -82,6 +82,12 @@ class PipelineTests(unittest.TestCase):
         )
 
         self.assertEqual(question.type, QuestionType.TEXT)
+
+    def test_enjoy_unknown_free_variant_is_converted_to_text(self):
+        self.assertEqual(
+            EnjoySurveyAdapter._question_type("type_free_custom", rows=0, option_count=0),
+            QuestionType.TEXT,
+        )
 
     def test_maps_screening_code_from_label_in_logic_instruction(self):
         question = QuestionSpec(
