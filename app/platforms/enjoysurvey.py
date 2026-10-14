@@ -236,6 +236,16 @@ class EnjoySurveyAdapter(PlatformAdapter):
             position=position,
         )
 
+    @staticmethod
+    def _expected_id_for_runtime_container(
+        platform_id: str,
+        group_id: str,
+        platform_to_expected: dict[str, str],
+        group_to_expected: dict[str, str],
+    ) -> str | None:
+        """Resolve either the matched response child or any child of its visible group."""
+        return platform_to_expected.get(platform_id) or group_to_expected.get(group_id)
+
     async def _discover_once(self, browser, url: str) -> tuple[list[dict], list[str]]:
         payloads_by_id: dict[str, dict] = {}
         sort_keys: dict[str, tuple[int, int]] = {}
@@ -524,6 +534,16 @@ class EnjoySurveyAdapter(PlatformAdapter):
         from playwright.async_api import async_playwright
 
         platform_to_expected = {match.observed_id: match.expected_id for match in matches}
+        # Conditional display rules in Enjoy are attached to a parent group,
+        # while the questionnaire question is usually matched to one of its
+        # children (for example, an image/info child plus a free-text child).
+        # A group is already visible when either child is rendered, so use the
+        # parent ID as an additional runtime signal for the expected question.
+        group_to_expected = {
+            self.group_by_question_id[match.observed_id]: match.expected_id
+            for match in matches
+            if match.observed_id in self.group_by_question_id
+        }
         expected_position_by_id = {
             match.expected_id: match.expected_position for match in matches
         }
@@ -738,7 +758,20 @@ class EnjoySurveyAdapter(PlatformAdapter):
                         current_ids.append(platform_id)
                         if platform_id not in visited_platform:
                             visited_platform.append(platform_id)
-                        expected_id = platform_to_expected.get(platform_id)
+                        group_id = await container.evaluate(
+                            """q => {
+                              const group = q.parentElement && q.parentElement.closest(
+                                '.question-container[data-question-id]'
+                              );
+                              return group ? (group.getAttribute('data-question-id') || '') : '';
+                            }"""
+                        )
+                        expected_id = self._expected_id_for_runtime_container(
+                            platform_id,
+                            str(group_id or ""),
+                            platform_to_expected,
+                            group_to_expected,
+                        )
                         if not expected_id and scenario.expected_texts:
                             # EXTRACT_QUESTIONS_JS may have joined the wording
                             # from an INFO/image sibling with this open input.
