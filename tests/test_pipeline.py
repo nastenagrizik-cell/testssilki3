@@ -100,6 +100,17 @@ class PipelineTests(unittest.TestCase):
 
         self.assertEqual(adapter.group_by_question_id["5777597"], "5777595")
 
+    def test_enjoy_resolves_visible_image_child_through_question_group(self):
+        self.assertEqual(
+            EnjoySurveyAdapter._expected_id_for_runtime_container(
+                platform_id="5777596",
+                group_id="5777595",
+                platform_to_expected={"5777597": "Q2"},
+                group_to_expected={"5777595": "Q2"},
+            ),
+            "Q2",
+        )
+
     def test_enjoy_unknown_free_variant_is_converted_to_text(self):
         self.assertEqual(
             EnjoySurveyAdapter._question_type("type_free_custom", rows=0, option_count=0),
