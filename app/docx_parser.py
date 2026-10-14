@@ -27,6 +27,11 @@ QUESTION_PATTERN = re.compile(
     rf"^\s*(?P<id>{QUESTION_ID_TOKEN})\s*[.)]?\s*[:.-]?\s*(?P<text>.+)$"
 )
 ANSWER_CODE_PATTERN = re.compile(r"^\s*(\d{1,3}(?:\.\d+)?)\s*$")
+INFO_PATTERN = re.compile(
+    r"^\s*(?:INFO|ИНФО|ИНФОБЛОК|ВВОДНЫЙ\s+ТЕКСТ(?:\s+ДЛЯ\s+[^:]+)?)"
+    r"\s*[:.\-–—]?\s*(?P<text>.+)$",
+    flags=re.I,
+)
 
 
 @dataclass
@@ -226,6 +231,17 @@ def _is_question_boundary(block: Block) -> bool:
         if _parse_question_candidate(candidate):
             return True
     return False
+
+
+def _info_from_block(block: Block) -> str | None:
+    """Return respondent-facing text from an explicitly labelled INFO block."""
+    if block.kind != "paragraph":
+        return None
+    match = INFO_PATTERN.match(normalize_space(block.text))
+    if not match:
+        return None
+    text = normalize_space(match.group("text"))
+    return text if any(char.isalpha() for char in text) else None
 
 
 def _infer_type(context: str, has_options: bool) -> QuestionType:
@@ -463,17 +479,26 @@ class DocxSurveyParser:
         blocks = extract_blocks(path)
         ignored_table_ids = _technical_table_ids(blocks)
         title = next((b.text for b in blocks if b.text), path.stem)
-        question_hits: list[tuple[int, str, str]] = []
-        question_boundaries = [position for position, block in enumerate(blocks) if _is_question_boundary(block)]
+        question_hits: list[tuple[int, str, str, QuestionType | None]] = []
+        info_counter = 0
         for position, block in enumerate(blocks):
             parsed = _question_from_block(block)
             if parsed:
-                question_hits.append((position, parsed[0], parsed[1]))
+                question_hits.append((position, parsed[0], parsed[1], None))
+                continue
+            info_text = _info_from_block(block)
+            if info_text:
+                info_counter += 1
+                question_hits.append(
+                    (position, f"INFO{info_counter}", info_text, QuestionType.INFO)
+                )
+
+        question_boundaries = [position for position, _, _, _ in question_hits]
 
         questions: list[QuestionSpec] = []
         warnings: list[str] = []
         seen_ids: dict[str, int] = {}
-        for hit_index, (position, qid, text) in enumerate(question_hits):
+        for hit_index, (position, qid, text, explicit_type) in enumerate(question_hits):
             next_position = next((item for item in question_boundaries if item > position), len(blocks))
             window = blocks[position:next_position]
             options: list[AnswerOption] = []
@@ -501,7 +526,7 @@ class DocxSurveyParser:
             )
             # First look for an explicit type in the wording/instructions;
             # only after that use the presence of options as a SINGLE fallback.
-            inferred_type = _infer_type(text, False)
+            inferred_type = explicit_type or _infer_type(text, False)
             if inferred_type == QuestionType.UNKNOWN:
                 inferred_type = _infer_type(local_context, False)
             if inferred_type == QuestionType.UNKNOWN:
@@ -627,7 +652,10 @@ class DocxSurveyParser:
                     if option.code in exclusive_codes:
                         option.exclusive = True
 
-        question_positions = [(position, question) for (position, _, _), question in zip(question_hits, questions)]
+        question_positions = [
+            (position, question)
+            for (position, _, _, _), question in zip(question_hits, questions)
+        ]
         question_block_positions = set(question_boundaries)
         rules = []
         for position, block in enumerate(blocks):
