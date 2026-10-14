@@ -194,12 +194,34 @@ class EnjoySurveyAdapter(PlatformAdapter):
         self.rotation_probe_runs = max(1, rotation_probe_runs)
         self.browser_executable_path = os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE") or None
         self.group_by_question_id: dict[str, str] = {}
+        # A go-pass URL is an entry point, not a fixed respondent URL.  Enjoy
+        # uses browser state to issue/resume the next pass when that same link
+        # is opened again.  Keep the state between discovery and logic routes
+        # even though each route gets an isolated Playwright context.
+        self._entry_storage_state: dict | None = None
 
     def _launch_options(self) -> dict:
         options: dict = {"headless": self.headless, "args": ["--no-sandbox"]}
         if self.browser_executable_path:
             options["executable_path"] = self.browser_executable_path
         return options
+
+    @staticmethod
+    def _is_go_pass_url(url: str) -> bool:
+        return "/survey/go-pass/" in urlparse(url).path.lower()
+
+    async def _new_context(self, browser, url: str):
+        options: dict = {"locale": "ru-RU"}
+        if self._is_go_pass_url(url) and self._entry_storage_state:
+            options["storage_state"] = self._entry_storage_state
+        return await browser.new_context(**options)
+
+    async def _close_context(self, context, url: str) -> None:
+        try:
+            if self._is_go_pass_url(url):
+                self._entry_storage_state = await context.storage_state()
+        finally:
+            await context.close()
 
     @classmethod
     def supports(cls, url: str) -> bool:
@@ -251,7 +273,7 @@ class EnjoySurveyAdapter(PlatformAdapter):
         sort_keys: dict[str, tuple[int, int]] = {}
         warnings: list[str] = []
         seen: set[str] = set()
-        context = await browser.new_context(locale="ru-RU")
+        context = await self._new_context(browser, url)
         page = await context.new_page()
         page.set_default_timeout(self.timeout_ms)
         try:
@@ -368,7 +390,7 @@ class EnjoySurveyAdapter(PlatformAdapter):
                         payloads_by_id[platform_id] = payload
                 warnings.append("Панель быстрого перехода не найдена; получен только текущий экран.")
         finally:
-            await context.close()
+            await self._close_context(context, url)
         insertion_order = {platform_id: index for index, platform_id in enumerate(payloads_by_id)}
         payloads = sorted(
             payloads_by_id.values(),
@@ -598,7 +620,7 @@ class EnjoySurveyAdapter(PlatformAdapter):
 
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(**self._launch_options())
-            context = await browser.new_context(locale="ru-RU")
+            context = await self._new_context(browser, url)
             page = await context.new_page()
             page.set_default_timeout(self.timeout_ms)
             try:
@@ -924,7 +946,7 @@ class EnjoySurveyAdapter(PlatformAdapter):
             except Exception as exc:
                 warnings.append(f"Прохождение остановлено: {type(exc).__name__}: {exc}")
             finally:
-                await context.close()
+                await self._close_context(context, url)
                 await browser.close()
         return ScenarioResult(
             scenario_id=scenario.id,
