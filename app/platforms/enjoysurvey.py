@@ -123,6 +123,8 @@ const payloads = leaves
   // response control is a more reliable type signal than the wrapper class.
   const rawType = domRawType === 'type_info' && hasTextField ? 'type_text' : domRawType;
   const platformId = q.getAttribute('data-question-id') || q.id || String(index);
+  const group = q.parentElement && q.parentElement.closest('.question-container[data-question-id]');
+  const groupId = group ? (group.getAttribute('data-question-id') || null) : null;
   const rawTitle = ownTitle(q) || mergedPromptById.get(platformId) || '';
   const titleText = rawTitle.split(/\\n+/).map(line => line.trim()).filter(line =>
     line && !/^(Выберите|Оцените|Ответьте|Укажите минимум|Укажите не более)/i.test(line)
@@ -154,6 +156,7 @@ const payloads = leaves
   const row_order = matrix_rows.map(row => row.code);
   return {
     platform_id: platformId,
+    group_id: groupId,
     reference_code: ((rawTitle.match(/^([A-Za-zА-Яа-яЁё]{1,5}\d+(?:[._]\d+|[A-Za-zА-Яа-яЁё]+)*)/) || [])[1] || null),
     text: titleText,
     raw_type: rawType,
@@ -190,6 +193,7 @@ class EnjoySurveyAdapter(PlatformAdapter):
         self.timeout_ms = timeout_ms
         self.rotation_probe_runs = max(1, rotation_probe_runs)
         self.browser_executable_path = os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE") or None
+        self.group_by_question_id: dict[str, str] = {}
 
     def _launch_options(self) -> dict:
         options: dict = {"headless": self.headless, "args": ["--no-sandbox"]}
@@ -215,10 +219,14 @@ class EnjoySurveyAdapter(PlatformAdapter):
         return QuestionType.INFO
 
     def _convert(self, payload: dict, position: int) -> ObservedQuestion:
+        platform_id = str(payload.get("platform_id", position))
+        group_id = payload.get("group_id")
+        if group_id and str(group_id) != platform_id:
+            self.group_by_question_id[platform_id] = str(group_id)
         options = [AnswerOption.model_validate(option) for option in payload.get("options", [])]
         matrix_rows = [AnswerOption.model_validate(option) for option in payload.get("matrix_rows", [])]
         return ObservedQuestion(
-            platform_id=str(payload.get("platform_id", position)),
+            platform_id=platform_id,
             reference_code=payload.get("reference_code"),
             text=payload.get("text", ""),
             type=self._question_type(payload.get("raw_type"), payload.get("rows", 0), len(options)),
@@ -525,6 +533,22 @@ class EnjoySurveyAdapter(PlatformAdapter):
             for target_id in target_ids
             if target_id in expected_position_by_id
         ]
+        assigned_matches = [
+            match
+            for match in sorted(matches, key=lambda item: item.expected_position)
+            if (
+                match.expected_id in scenario.assignments
+                and (not target_positions or match.expected_position < min(target_positions))
+            )
+        ]
+        preferred_start_match = assigned_matches[-1] if assigned_matches else None
+        preferred_start_id = (
+            self.group_by_question_id.get(
+                preferred_start_match.observed_id, preferred_start_match.observed_id
+            )
+            if preferred_start_match
+            else None
+        )
         visited_platform: list[str] = []
         visited_expected: list[str] = []
         observed_questions: list[ObservedQuestion] = []
@@ -558,18 +582,71 @@ class EnjoySurveyAdapter(PlatformAdapter):
             page = await context.new_page()
             page.set_default_timeout(self.timeout_ms)
             try:
-                response = await page.goto(url, wait_until="domcontentloaded")
+                response = None
+                # Enjoy test links keep one respondent state on the server.
+                # A normal GET may therefore reopen the screen left by the
+                # previous route or even an already screened-out respondent.
+                # The platform's own debug panel starts at a chosen question
+                # by POSTing to /goto/. Do the same for the nearest controller.
+                if (
+                    preferred_start_id
+                    and url.startswith(("http://", "https://"))
+                    and "/index/" in url
+                ):
+                    jump_url = url.replace("/index/", "/goto/", 1)
+                    try:
+                        await page.set_content(
+                            '<form id="survey-qa-jump" method="post"></form>'
+                        )
+                        async with page.expect_navigation(
+                            wait_until="domcontentloaded", timeout=self.timeout_ms
+                        ) as navigation:
+                            await page.locator("#survey-qa-jump").evaluate(
+                                """(form, data) => {
+                                  form.action = data.url;
+                                  const input = document.createElement('input');
+                                  input.type = 'hidden';
+                                  input.name = 'questionId';
+                                  input.value = data.questionId;
+                                  form.appendChild(input);
+                                  form.submit();
+                                }""",
+                                {"url": jump_url, "questionId": preferred_start_id},
+                            )
+                        response = await navigation.value
+                    except Exception:
+                        response = await page.goto(url, wait_until="domcontentloaded")
+                else:
+                    response = await page.goto(url, wait_until="domcontentloaded")
                 if response and response.status >= 400:
                     raise RuntimeError(f"EnjoySurvey вернул HTTP {response.status}")
                 if "/user/login" in page.url:
                     raise RuntimeError(
                         "EnjoySurvey перенаправил на страницу входа; тестовая ссылка недоступна"
                     )
-                await page.wait_for_selector(
-                    VISIBLE_LEAF_QUESTION_SELECTOR,
-                    state="attached",
-                    timeout=self.timeout_ms,
-                )
+                if "status=2" in page.url:
+                    raise RuntimeError(
+                        "Тестовый респондент EnjoySurvey уже завершён по скринингу; "
+                        "этот маршрут нельзя считать проверкой логики."
+                    )
+                try:
+                    await page.wait_for_selector(
+                        VISIBLE_LEAF_QUESTION_SELECTOR,
+                        state="attached",
+                        timeout=self.timeout_ms,
+                    )
+                except Exception:
+                    # The redirect can happen while Playwright is waiting for
+                    # the first question.  Replace its long internal call log
+                    # with the actual platform state; this route is
+                    # inconclusive, not proof that the target question is
+                    # missing.
+                    if "status=2" in page.url:
+                        raise RuntimeError(
+                            "Тестовый респондент EnjoySurvey завершён по скринингу; "
+                            "для проверки ветки нужен новый тестовый запуск."
+                        )
+                    raise
                 # Test links can remember the last debug jump made during the
                 # structural inventory pass.  Start every scenario from the
                 # earliest matched questionnaire question instead of whatever
@@ -584,10 +661,11 @@ class EnjoySurveyAdapter(PlatformAdapter):
                             str(candidate["value"]) for candidate in start_candidates
                         }
                         assigned_starts = [
-                            match
+                            (match, self.group_by_question_id.get(match.observed_id, match.observed_id))
                             for match in sorted(matches, key=lambda item: item.expected_position)
                             if (
-                                match.observed_id in available_start_ids
+                                self.group_by_question_id.get(match.observed_id, match.observed_id)
+                                in available_start_ids
                                 and match.expected_id in scenario.assignments
                                 and (
                                     not target_positions
@@ -596,9 +674,10 @@ class EnjoySurveyAdapter(PlatformAdapter):
                             )
                         ]
                         matched_starts = [
-                            match
+                            (match, self.group_by_question_id.get(match.observed_id, match.observed_id))
                             for match in sorted(matches, key=lambda item: item.expected_position)
-                            if match.observed_id in available_start_ids
+                            if self.group_by_question_id.get(match.observed_id, match.observed_id)
+                            in available_start_ids
                         ]
                         # A logic route should start at the nearest controlling
                         # question (Q1 for Q2/Q3), not traverse the entire
@@ -606,9 +685,9 @@ class EnjoySurveyAdapter(PlatformAdapter):
                         # prevents unrelated later validation from making a
                         # proven branch look inconclusive.
                         start_id = (
-                            assigned_starts[-1].observed_id
+                            assigned_starts[-1][1]
                             if assigned_starts
-                            else matched_starts[0].observed_id
+                            else matched_starts[0][1]
                             if matched_starts
                             else str(start_candidates[0]["value"])
                         )
