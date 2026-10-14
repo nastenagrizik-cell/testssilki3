@@ -83,6 +83,23 @@ class PipelineTests(unittest.TestCase):
 
         self.assertEqual(question.type, QuestionType.TEXT)
 
+    def test_enjoy_remembers_parent_group_for_conditional_child(self):
+        adapter = EnjoySurveyAdapter()
+        adapter._convert(
+            {
+                "platform_id": "5777597",
+                "group_id": "5777595",
+                "text": "Почему Вы выбрали этот вариант?",
+                "raw_type": "type_free",
+                "options": [],
+                "rows": 0,
+                "matrix_rows": [],
+            },
+            0,
+        )
+
+        self.assertEqual(adapter.group_by_question_id["5777597"], "5777595")
+
     def test_enjoy_unknown_free_variant_is_converted_to_text(self):
         self.assertEqual(
             EnjoySurveyAdapter._question_type("type_free_custom", rows=0, option_count=0),
