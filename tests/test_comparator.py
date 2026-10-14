@@ -139,9 +139,14 @@ class ComparatorTests(unittest.TestCase):
             ],
         )
 
-        codes = {issue.code for issue in compare_surveys(SurveySpec(title="Тест", questions=[question]), observed).issues}
+        issues = compare_surveys(SurveySpec(title="Тест", questions=[question]), observed).issues
+        codes = {issue.code for issue in issues}
 
         self.assertIn("missing_matrix_row", codes)
+        self.assertEqual(
+            next(issue.severity for issue in issues if issue.code == "missing_matrix_row"),
+            "critical",
+        )
 
     def test_reports_when_all_answer_options_are_absent(self):
         options = [AnswerOption(code="1", text="Да"), AnswerOption(code="2", text="Нет")]
@@ -216,8 +221,25 @@ class ComparatorTests(unittest.TestCase):
 
         self.assertEqual(len(option_issues), 1)
         self.assertEqual(option_issues[0].code, "option_text_mismatch")
+        self.assertEqual(option_issues[0].severity, "critical")
         self.assertEqual(option_issues[0].expected, "Скорее нравится")
         self.assertEqual(option_issues[0].actual, "Скорее подходит")
+
+    def test_missing_info_block_is_reported_as_critical(self):
+        info = QuestionSpec(
+            id="INFO1",
+            text="Внимательно посмотрите на описание бургера.",
+            type=QuestionType.INFO,
+            source=SourceLocation(block_index=1, kind="paragraph"),
+        )
+        report = compare_surveys(
+            SurveySpec(title="Тест", questions=[info]),
+            ObservedSurvey(platform="EnjoySurvey", source_url="https://example.test/survey"),
+        )
+
+        issue = next(issue for issue in report.issues if issue.code == "missing_question")
+        self.assertEqual(issue.question_id, "INFO1")
+        self.assertEqual(issue.severity, "critical")
 
     def test_scale_number_prefix_is_not_a_wording_error_but_wrong_label_is(self):
         expected = expected_question(
