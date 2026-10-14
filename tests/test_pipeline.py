@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 
 from app.models import (
@@ -110,6 +111,41 @@ class PipelineTests(unittest.TestCase):
             ),
             "Q2",
         )
+
+    def test_enjoy_reuses_browser_state_only_for_go_pass_entry_links(self):
+        class FakeContext:
+            async def storage_state(self):
+                return {"cookies": [{"name": "pass-session", "value": "next"}], "origins": []}
+
+            async def close(self):
+                return None
+
+        class FakeBrowser:
+            def __init__(self):
+                self.calls = []
+
+            async def new_context(self, **options):
+                self.calls.append(options)
+                return FakeContext()
+
+        async def exercise():
+            adapter = EnjoySurveyAdapter()
+            browser = FakeBrowser()
+            entry_url = "https://enjoysurvey.ru/survey/go-pass/74587/token"
+            first = await adapter._new_context(browser, entry_url)
+            await adapter._close_context(first, entry_url)
+            await adapter._new_context(browser, entry_url)
+            await adapter._new_context(
+                browser,
+                "https://n.enjoysurvey.com/ru/survey/34467/index/next_test_token",
+            )
+            return browser.calls
+
+        calls = asyncio.run(exercise())
+
+        self.assertNotIn("storage_state", calls[0])
+        self.assertEqual(calls[1]["storage_state"]["cookies"][0]["name"], "pass-session")
+        self.assertNotIn("storage_state", calls[2])
 
     def test_enjoy_unknown_free_variant_is_converted_to_text(self):
         self.assertEqual(
