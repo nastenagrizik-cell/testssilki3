@@ -244,6 +244,28 @@ class DocxParserTests(unittest.TestCase):
 
         self.assertEqual(spec.questions[0].type, QuestionType.SINGLE)
 
+    def test_reads_explicit_info_and_intro_text_as_questions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "info-blocks.docx"
+            document = Document()
+            document.add_paragraph("INFO: Внимательно посмотрите на описание бургера.")
+            document.add_paragraph(
+                "Вводный текст для концепции: Далее мы зададим несколько вопросов о Вашем впечатлении."
+            )
+            document.add_paragraph("Q1. Понравилась ли Вам концепция?")
+            document.add_paragraph("Один ответ")
+            document.save(path)
+
+            spec = DocxSurveyParser().parse(path)
+
+        self.assertEqual([question.id for question in spec.questions], ["INFO1", "INFO2", "Q1"])
+        self.assertEqual(spec.questions[0].type, QuestionType.INFO)
+        self.assertEqual(spec.questions[0].text, "Внимательно посмотрите на описание бургера.")
+        self.assertEqual(
+            spec.questions[1].text,
+            "Далее мы зададим несколько вопросов о Вашем впечатлении.",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
