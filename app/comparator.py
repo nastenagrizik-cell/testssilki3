@@ -285,7 +285,7 @@ def _compare_options(
             issues.append(
                 Issue(
                     code="option_text_mismatch",
-                    severity="minor",
+                    severity="critical",
                     title=f"Отличается формулировка варианта {expected_option.code}",
                     expected=expected_option.text,
                     actual=actual_option.text,
@@ -338,7 +338,7 @@ def _compare_matrix_rows(expected: QuestionSpec, actual, issues: list[Issue]) ->
             issues.append(
                 Issue(
                     code="missing_matrix_row",
-                    severity="major",
+                    severity="critical",
                     title="В матрице не найдена строка из Word",
                     expected=expected_row.text,
                     question_id=expected.id,
@@ -351,7 +351,7 @@ def _compare_matrix_rows(expected: QuestionSpec, actual, issues: list[Issue]) ->
             issues.append(
                 Issue(
                     code="matrix_row_text_mismatch",
-                    severity="minor",
+                    severity="critical",
                     title="Формулировка строки матрицы отличается",
                     expected=expected_row.text,
                     actual=actual_row.text,
