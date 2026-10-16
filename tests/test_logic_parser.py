@@ -4,6 +4,22 @@ from app.logic_parser import parse_logic_rule, parse_logic_rules, parse_rotation
 
 
 class LogicParserTests(unittest.TestCase):
+    def test_parses_not_equal_written_in_words(self):
+        rule = parse_logic_rule("Показывать только если B5 НЕ равно коду 99")
+
+        self.assertIsNotNone(rule)
+        self.assertEqual(rule.condition.atoms[0].question_id, "B5")
+        self.assertEqual(rule.condition.atoms[0].operator, "not_in")
+        self.assertEqual(rule.condition.atoms[0].values, ["99"])
+
+    def test_parses_zadavat_as_show_instruction(self):
+        rule = parse_logic_rule("Задавать, если А5 не равно «99»")
+
+        self.assertIsNotNone(rule)
+        self.assertEqual(rule.action, "show")
+        self.assertEqual(rule.condition.atoms[0].question_id, "A5")
+        self.assertEqual(rule.condition.atoms[0].operator, "not_in")
+
     def test_parses_show_rule_with_code_range(self):
         rules = parse_logic_rules("Показать Q2, если в Q1 выбраны коды 3-5")
 
