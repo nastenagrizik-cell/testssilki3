@@ -5,6 +5,7 @@ from app.models import (
     AnswerOption,
     ConditionAtom,
     ConditionGroup,
+    ConceptRun,
     LogicRule,
     ObservedQuestion,
     ObservedSurvey,
@@ -362,6 +363,38 @@ class ComparatorTests(unittest.TestCase):
             {issue.code for issue in compare_surveys(SurveySpec(title="Тест", questions=[expected]), observed).issues},
         )
 
+    def test_ignores_platform_minimum_answer_and_scale_hints(self):
+        expected = expected_question(
+            "B1",
+            "Выберите названия, которые соответствуют характеристикам.",
+            [AnswerOption(code="1", text="Мохито")],
+        )
+        observed = ObservedSurvey(
+            platform="EnjoySurvey",
+            source_url="https://example.test/survey",
+            questions=[
+                ObservedQuestion(
+                    platform_id="1",
+                    text=(
+                        "Выберите названия, которые соответствуют характеристикам. "
+                        "Выберите минимум 1 ответ(ов)"
+                    ),
+                    type=QuestionType.SINGLE,
+                    options=[AnswerOption(code="10", text="Мохито")],
+                )
+            ],
+        )
+        report = compare_surveys(SurveySpec(title="Тест", questions=[expected]), observed)
+        self.assertNotIn("question_text_mismatch", {issue.code for issue in report.issues})
+
+        expected.text = "Насколько вероятно, что Вы расскажете друзьям?"
+        observed.questions[0].text = (
+            "Насколько вероятно, что Вы расскажете друзьям? "
+            "Оцените по шкале от 1 до 5, где 1 — точно нет, 5 — точно да"
+        )
+        report = compare_surveys(SurveySpec(title="Тест", questions=[expected]), observed)
+        self.assertNotIn("question_text_mismatch", {issue.code for issue in report.issues})
+
     def test_reference_code_prevents_similar_questions_from_being_swapped(self):
         first = expected_question("S8", "Какие блюда Вы покупали?", [AnswerOption(code="1", text="Бургеры")])
         second = expected_question("S9", "Какие блюда Вы не будете покупать?", [AnswerOption(code="1", text="Бургеры")])
@@ -548,6 +581,62 @@ class ComparatorTests(unittest.TestCase):
             ],
         )
         self.assertEqual(compare_surveys(spec, observed).issues, [])
+
+    def test_reports_incomplete_concept_coverage_as_warning(self):
+        spec = SurveySpec(
+            title="Тест",
+            metadata={
+                "concepts": [
+                    {"id": "concept-1", "label": "Концепция 1"},
+                    {"id": "concept-2", "label": "Концепция 2"},
+                    {"id": "concept-3", "label": "Концепция 3"},
+                ]
+            },
+        )
+        observed = ObservedSurvey(
+            platform="EnjoySurvey",
+            source_url="https://example.test/survey",
+            concept_attempts=18,
+            concept_runs=[
+                ConceptRun(
+                    attempt=1,
+                    signature="one",
+                    concept_id="concept-1",
+                    concept_label="Концепция 1",
+                )
+            ],
+        )
+
+        report = compare_surveys(spec, observed)
+
+        self.assertEqual(report.expected_concept_count, 3)
+        self.assertEqual(report.observed_concept_count, 1)
+        issue = next(item for item in report.issues if item.code == "concept_coverage_incomplete")
+        self.assertEqual(issue.severity, "warning")
+        self.assertIn("Концепция 2", issue.actual)
+
+    def test_dynamic_concept_placeholder_matches_one_actual_variant(self):
+        expected = expected_question(
+            "Q8",
+            "Оцените основу этого бургера (булочке или вафле)?",
+            [],
+        )
+        spec = SurveySpec(title="Тест", questions=[expected])
+        observed = ObservedSurvey(
+            platform="EnjoySurvey",
+            source_url="https://example.test/survey",
+            questions=[
+                ObservedQuestion(
+                    platform_id="8",
+                    text="Оцените основу этого бургера (вафле)?",
+                    type=QuestionType.SINGLE,
+                )
+            ],
+        )
+
+        codes = {issue.code for issue in compare_surveys(spec, observed).issues}
+
+        self.assertNotIn("question_text_mismatch", codes)
 
 
 if __name__ == "__main__":
