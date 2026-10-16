@@ -14,6 +14,7 @@ def looks_like_instruction(text: str) -> bool:
     markers = (
         "ЕСЛИ",
         "ЗАДАТЬ",
+        "ЗАДАВАТЬ",
         "ПОКАЗАТЬ",
         "ПОКАЗЫВАТЬ",
         "НЕ ПОКАЗЫВАТЬ",
@@ -44,7 +45,7 @@ def _action(text: str) -> str:
         return "terminate"
     if "ПРОДОЛЖ" in upper:
         return "continue"
-    if re.search(r"ЗАДАТ|ПОКАЗ|ВЫВЕСТ", upper) or upper.startswith("ЕСЛИ"):
+    if re.search(r"ЗАДА(?:ТЬ|ВАТЬ)|ПОКАЗ|ВЫВЕСТ", upper) or upper.startswith("ЕСЛИ"):
         return "show"
     if re.search(r"РОТАЦ|РОТИРОВ|СЛУЧАЙН", upper):
         return "rotate"
@@ -53,7 +54,7 @@ def _action(text: str) -> str:
 
 def _target(text: str) -> str | None:
     match = re.search(
-        rf"(?:ЗАДАТЬ|ПОКАЗАТЬ|ПОКАЗЫВАТЬ|НЕ\s+ПОКАЗЫВАТЬ|НЕ\s+ЗАДАВАТЬ)\s+(?:ВОПРОС\s+)?({QUESTION_ID})",
+        rf"(?:ЗАДАТЬ|ЗАДАВАТЬ|ПОКАЗАТЬ|ПОКАЗЫВАТЬ|НЕ\s+ПОКАЗЫВАТЬ|НЕ\s+ЗАДАВАТЬ)\s+(?:ВОПРОС\s+)?({QUESTION_ID})",
         text,
         flags=re.I,
     )
@@ -79,6 +80,28 @@ def _condition(text: str) -> ConditionGroup | None:
             continue
         op = "not_in" if match.group("op") in {"!=", "<>", "≠"} else "in"
         atoms.append(ConditionAtom(question_id=normalize_id(match.group("qid")), operator=op, values=values))
+
+    word_comparison = re.compile(
+        rf"(?P<qid>{QUESTION_ID})\s+(?P<negative>НЕ\s+)?РАВН\w*\s+"
+        rf"(?:КОД(?:У|ОМ|А|Ы)?\s*)?[«\"']?(?P<values>\d+(?:\s*[-–—,;/]\s*\d+)*)",
+        flags=re.I,
+    )
+    for match in word_comparison.finditer(condition_text):
+        values = parse_code_list(match.group("values"))
+        if not values:
+            continue
+        atom = ConditionAtom(
+            question_id=normalize_id(match.group("qid")),
+            operator="not_in" if match.group("negative") else "in",
+            values=values,
+        )
+        if not any(
+            item.question_id == atom.question_id
+            and item.operator == atom.operator
+            and item.values == atom.values
+            for item in atoms
+        ):
+            atoms.append(atom)
 
     verbal = re.compile(
         rf"(?:В\s+)?(?P<qid>{QUESTION_ID}).{{0,45}}?(?:ОТМЕЧЕН|ВЫБРАН|ВЫБРАЛ|КОД(?:Ы)?|РАВЕН).{{0,12}}?(?P<values>\d+(?:\s*[-–—,;/]\s*\d+)*)",
@@ -112,7 +135,7 @@ def parse_logic_rule(text: str, source_block: int | None = None) -> LogicRule | 
         and condition is None
         and target is None
         and "ТЕСТИРУЕТ" not in upper
-        and not re.search(r"ЗАДАТ|ПОКАЗ|ВЫВЕСТ", upper)
+        and not re.search(r"ЗАДА(?:ТЬ|ВАТЬ)|ПОКАЗ|ВЫВЕСТ", upper)
     ):
         # Natural question/answer wording can start with "если" without
         # describing survey routing (for example, "Если продукт появится...").
