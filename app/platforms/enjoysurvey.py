@@ -2,18 +2,22 @@ from __future__ import annotations
 
 import os
 import re
-from urllib.parse import parse_qs, urlparse
+import hashlib
+from pathlib import PurePosixPath
+from urllib.parse import parse_qs, unquote, urlparse
 
 from ..models import (
     AnswerOption,
+    ConceptRun,
     ObservedQuestion,
     ObservedSurvey,
     QuestionMatch,
     QuestionType,
     ScenarioResult,
+    SurveySpec,
     TestScenario,
 )
-from ..normalization import text_similarity
+from ..normalization import normalize_space, text_similarity
 from .base import PlatformAdapter
 
 
@@ -31,6 +35,8 @@ TYPE_MAP = {
     "type_ranking": QuestionType.RANKING,
     "type_info": QuestionType.INFO,
     "type_grid": QuestionType.MATRIX_SINGLE,
+    "type_matrix_single": QuestionType.MATRIX_SINGLE,
+    "type_matrix_multi": QuestionType.MATRIX_MULTI,
 }
 
 LEAF_QUESTION_SELECTOR = (
@@ -70,13 +76,12 @@ const ownTitle = q => {
 const mergedPromptById = new Map();
 const suppressedPromptIds = new Set();
 
-// Some Enjoy screens split one respondent question into two leaf components:
-// a type_info concept/image and a type_free open answer.  The info component
-// is presentation, not a separate questionnaire question.  Suppress it even
-// when the free component has its own title; borrow its title only when the
-// response component has none.
+// Some Enjoy screens split one respondent question into an informational
+// prompt/image plus a response component.  This is used not only for open
+// answers, but also for grouped single/multiple and matrix questions.  The
+// info component is presentation, not a separate questionnaire question.
 for (const responseLeaf of leaves) {
-  if (!responseLeaf.querySelector(textFieldSelector)) continue;
+  if (!responseLeaf.querySelector(responseSelector)) continue;
   const parent = responseLeaf.parentElement && responseLeaf.parentElement.closest(
     '.question-container[data-question-id]'
   );
@@ -126,9 +131,12 @@ const payloads = leaves
   const group = q.parentElement && q.parentElement.closest('.question-container[data-question-id]');
   const groupId = group ? (group.getAttribute('data-question-id') || null) : null;
   const rawTitle = ownTitle(q) || mergedPromptById.get(platformId) || '';
-  const titleText = rawTitle.split(/\\n+/).map(line => line.trim()).filter(line =>
-    line && !/^(Выберите|Оцените|Ответьте|Укажите минимум|Укажите не более)/i.test(line)
-  ).join(' ');
+  const titleText = rawTitle.split(/\n+/).map(line => line.trim()).filter(line =>
+    line && !/^(?:(?:Выберите|Укажите)\s+(?:минимум|не менее|не более|максимум|ровно)\s+\d+|(?:Минимум|Максимум)\s+\d+)\s+(?:вариант\w*|ответ\w*)/i.test(line)
+  ).join(' ').replace(
+    /\s+(?:(?:Выберите|Укажите)\s+(?:минимум|не менее|не более|максимум|ровно)\s+\d+|(?:Минимум|Максимум)\s+\d+)\s+(?:вариант\w*|ответ\w*)(?:\s*\([^)]*\))?.*$/i,
+    ''
+  ).trim();
   const options = [];
   const seen = new Set();
   for (const item of q.querySelectorAll('[data-value-code]')) {
@@ -138,10 +146,15 @@ const payloads = leaves
     const key = code + '\u0000' + text;
     if (!text || seen.has(key)) continue;
     seen.add(key);
+    const exclusiveAncestor = item.closest('.exclusive, [data-exclusive="true"], [data-is-exclusive="true"]');
     options.push({
       code,
       text,
-      exclusive: Boolean(item.querySelector('.exclusive') || item.classList.contains('exclusive')),
+      exclusive: Boolean(
+        item.querySelector('.exclusive, [data-exclusive="true"], [data-is-exclusive="true"]')
+        || item.classList.contains('exclusive')
+        || (exclusiveAncestor && q.contains(exclusiveAncestor))
+      ),
       fixed: false,
     });
   }
@@ -154,6 +167,14 @@ const payloads = leaves
     return {code: code || String(rowIndex + 1), text, exclusive: false, fixed: false};
   }).filter(row => row.text);
   const row_order = matrix_rows.map(row => row.code);
+  const media_urls = Array.from(q.querySelectorAll('img, source, video'))
+    .flatMap(node => [
+      node.currentSrc,
+      node.getAttribute('src'),
+      node.getAttribute('data-src'),
+      node.getAttribute('srcset')
+    ])
+    .filter(value => value && !value.startsWith('data:'));
   return {
     platform_id: platformId,
     group_id: groupId,
@@ -166,6 +187,7 @@ const payloads = leaves
     row_order,
     has_text_field: hasTextField,
     dom_raw_type: domRawType,
+    media_urls: Array.from(new Set(media_urls)),
   };
 });
 // Empty image-only children are demonstrations inside a question group, not
@@ -194,11 +216,22 @@ class EnjoySurveyAdapter(PlatformAdapter):
         self.rotation_probe_runs = max(1, rotation_probe_runs)
         self.browser_executable_path = os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE") or None
         self.group_by_question_id: dict[str, str] = {}
+        self.concept_attempt_limit = max(1, int(os.getenv("MAX_CONCEPT_ATTEMPTS", "18")))
+        self._spec: SurveySpec | None = None
+        self._baseline_assignments: dict[str, list[str]] = {}
+        self._concept_sessions: dict[str, tuple[str, dict]] = {}
         # A go-pass URL is an entry point, not a fixed respondent URL.  Enjoy
         # uses browser state to issue/resume the next pass when that same link
         # is opened again.  Keep the state between discovery and logic routes
         # even though each route gets an isolated Playwright context.
         self._entry_storage_state: dict | None = None
+
+    def configure_spec(self, spec: SurveySpec) -> None:
+        """Provide Word-only routing information used by monadic probes."""
+        from ..planner import _baseline_assignments
+
+        self._spec = spec
+        self._baseline_assignments = _baseline_assignments(spec)
 
     def _launch_options(self) -> dict:
         options: dict = {"headless": self.headless, "args": ["--no-sandbox"]}
@@ -230,6 +263,8 @@ class EnjoySurveyAdapter(PlatformAdapter):
 
     @staticmethod
     def _question_type(raw_type: str | None, rows: int, option_count: int) -> QuestionType:
+        if rows > 1 and raw_type == "type_multi":
+            return QuestionType.MATRIX_MULTI
         if rows > 1 and raw_type == "type_group":
             return QuestionType.MATRIX_SINGLE
         if raw_type in TYPE_MAP:
@@ -239,6 +274,79 @@ class EnjoySurveyAdapter(PlatformAdapter):
         if option_count:
             return QuestionType.SINGLE
         return QuestionType.INFO
+
+    @staticmethod
+    def _merge_grouped_matrix_payloads(payloads: list[dict]) -> list[dict]:
+        """Collapse repeated response children that implement one visual matrix.
+
+        Enjoy can program a matrix as a group containing one almost identical
+        multi/single child per matrix unit.  Treating every child as a separate
+        question creates several false "extra question" errors.  We merge only
+        highly conservative candidates: same parent, near-identical prompt and
+        strongly overlapping answer labels.
+        """
+        grouped: dict[str, list[tuple[int, dict]]] = {}
+        for index, payload in enumerate(payloads):
+            group_id = str(payload.get("group_id") or "")
+            if group_id and payload.get("options"):
+                grouped.setdefault(group_id, []).append((index, payload))
+
+        replacements: dict[int, dict] = {}
+        suppressed: set[int] = set()
+        for group_id, entries in grouped.items():
+            if len(entries) < 2:
+                continue
+            prompts = [normalize_space(str(item.get("text", ""))) for _, item in entries]
+            if not prompts or not prompts[0] or any(
+                text_similarity(prompts[0], prompt) < 0.92 for prompt in prompts[1:]
+            ):
+                continue
+            option_sets = [
+                {
+                    normalize_space(str(option.get("text", ""))).lower()
+                    for option in item.get("options", [])
+                    if normalize_space(str(option.get("text", "")))
+                }
+                for _, item in entries
+            ]
+            baseline = option_sets[0]
+            if not baseline or any(
+                len(baseline & values) / max(1, min(len(baseline), len(values))) < 0.75
+                for values in option_sets[1:]
+            ):
+                continue
+
+            first_index, first = entries[0]
+            merged = dict(first)
+            merged["platform_id"] = group_id
+            merged["group_id"] = None
+            merged["raw_type"] = (
+                "type_matrix_multi"
+                if any(item.get("raw_type") == "type_multi" for _, item in entries)
+                else "type_matrix_single"
+            )
+            merged["child_platform_ids"] = [
+                str(item.get("platform_id", "")) for _, item in entries
+            ]
+            merged_rows: list[dict] = []
+            seen_rows: set[str] = set()
+            for _, item in entries:
+                for row in item.get("matrix_rows", []):
+                    key = normalize_space(str(row.get("text", ""))).lower()
+                    if key and key not in seen_rows:
+                        seen_rows.add(key)
+                        merged_rows.append(row)
+            merged["matrix_rows"] = merged_rows
+            merged["rows"] = len(merged_rows)
+            merged["row_order"] = [str(row.get("code", "")) for row in merged_rows]
+            replacements[first_index] = merged
+            suppressed.update(index for index, _ in entries[1:])
+
+        return [
+            replacements.get(index, payload)
+            for index, payload in enumerate(payloads)
+            if index not in suppressed
+        ]
 
     def _convert(self, payload: dict, position: int) -> ObservedQuestion:
         platform_id = str(payload.get("platform_id", position))
@@ -349,7 +457,7 @@ class EnjoySurveyAdapter(PlatformAdapter):
                             await page.wait_for_function(
                                 "before => Array.from(document.querySelectorAll('.question-container[data-question-id]')).filter(q => !q.querySelector('.question-container[data-question-id]')).map(q => q.getAttribute('data-question-id')).join('|') !== before",
                                 arg=before,
-                                timeout=min(self.timeout_ms, 3_000),
+                                timeout=min(self.timeout_ms, 900),
                             )
                         except Exception:
                             # Some menu entries are group aliases or point to
@@ -379,7 +487,10 @@ class EnjoySurveyAdapter(PlatformAdapter):
                                 seen.add(platform_id)
                                 payloads_by_id[platform_id] = payload
                     except Exception as exc:  # one broken jump should not cancel the whole audit
-                        if "ГРУППА ВОПРОСОВ" not in str(option.get("text", "")).upper():
+                        if (
+                            type(exc).__name__ != "TimeoutError"
+                            and "ГРУППА ВОПРОСОВ" not in str(option.get("text", "")).upper()
+                        ):
                             warnings.append(f"Пункт быстрого перехода {value} недоступен: {type(exc).__name__}")
             else:
                 payloads = await page.evaluate(EXTRACT_QUESTIONS_JS)
@@ -399,7 +510,557 @@ class EnjoySurveyAdapter(PlatformAdapter):
                 (len(sort_keys) + 1, insertion_order.get(str(payload.get("platform_id", "")), 0)),
             ),
         )
-        return payloads, warnings
+        return self._merge_grouped_matrix_payloads(payloads), warnings
+
+    def _payload_expected_map(self, payloads: list[dict]) -> dict[str, str]:
+        if not self._spec:
+            return {}
+        candidates: list[tuple[float, int, int]] = []
+        for expected_index, expected in enumerate(self._spec.questions):
+            for payload_index, payload in enumerate(payloads):
+                text = str(payload.get("text", ""))
+                score = text_similarity(expected.text, text)
+                reference = str(payload.get("reference_code") or "").upper()
+                if reference and reference == expected.id.upper():
+                    score += 1.0
+                candidates.append((score, expected_index, payload_index))
+        used_expected: set[int] = set()
+        used_payloads: set[int] = set()
+        result: dict[str, str] = {}
+        for score, expected_index, payload_index in sorted(candidates, reverse=True):
+            if score < 0.34 or expected_index in used_expected or payload_index in used_payloads:
+                continue
+            platform_id = str(payloads[payload_index].get("platform_id", ""))
+            if not platform_id:
+                continue
+            used_expected.add(expected_index)
+            used_payloads.add(payload_index)
+            result[platform_id] = self._spec.questions[expected_index].id
+        return result
+
+    def _probe_answer_code_map(
+        self,
+        payloads: list[dict],
+        platform_to_expected: dict[str, str],
+    ) -> dict[str, dict[str, str]]:
+        if not self._spec:
+            return {}
+        expected_by_id = {question.id: question for question in self._spec.questions}
+        result: dict[str, dict[str, str]] = {}
+        for payload in payloads:
+            expected_id = platform_to_expected.get(str(payload.get("platform_id", "")))
+            expected = expected_by_id.get(expected_id or "")
+            actual_options = payload.get("options", [])
+            if not expected or not actual_options:
+                continue
+            available = set(range(len(actual_options)))
+            for option in expected.options:
+                ranked = sorted(
+                    (
+                        (text_similarity(option.text, str(actual_options[index].get("text", ""))), index)
+                        for index in available
+                    ),
+                    reverse=True,
+                )
+                if ranked and ranked[0][0] >= 0.5:
+                    _, index = ranked[0]
+                    available.remove(index)
+                    result.setdefault(expected.id, {})[option.code] = str(
+                        actual_options[index].get("code", "")
+                    )
+        return result
+
+    @staticmethod
+    def _transliterate(value: str) -> str:
+        table = {
+            "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e",
+            "ё": "e", "ж": "zh", "з": "z", "и": "i", "й": "j", "к": "k",
+            "л": "l", "м": "m", "н": "n", "о": "o", "п": "p", "р": "r",
+            "с": "s", "т": "t", "у": "u", "ф": "f", "х": "h", "ц": "c",
+            "ч": "ch", "ш": "sh", "щ": "sch", "ъ": "", "ы": "y", "ь": "",
+            "э": "e", "ю": "yu", "я": "ya",
+        }
+        return "".join(table.get(char, char) for char in value.lower())
+
+    def _concept_from_media(
+        self,
+        media_urls: list[str],
+        observed_expected_ids: list[str],
+        signature_to_concept: dict[str, str],
+        signature: str,
+    ) -> tuple[str | None, str | None]:
+        concepts = list((self._spec.metadata if self._spec else {}).get("concepts", []))
+        if not concepts:
+            return None, None
+        by_id = {str(item["id"]): item for item in concepts}
+        if signature in signature_to_concept:
+            concept_id = signature_to_concept[signature]
+            return concept_id, str(by_id[concept_id]["label"])
+
+        filenames = " ".join(
+            unquote(PurePosixPath(urlparse(url).path).stem) for url in media_urls
+        )
+        clean_filename = re.sub(r"[-_][0-9a-f]{7,}$", "", filenames, flags=re.I)
+        normalized_filename = re.sub(r"[^a-z0-9]+", " ", clean_filename.lower()).strip()
+        version_match = re.search(
+            r"(?:vafl\w*|waffl\w*|variant\w*|monad\w*|concept\w*|v)\s*[-_ ]?(\d+)",
+            clean_filename,
+            flags=re.I,
+        )
+        if version_match:
+            version_id = f"concept-{version_match.group(1)}"
+            if version_id in by_id:
+                signature_to_concept[signature] = version_id
+                return version_id, str(by_id[version_id]["label"])
+
+        ranked: list[tuple[float, str]] = []
+        for concept in concepts:
+            aliases = [str(concept.get("label", "")), *map(str, concept.get("aliases", []))]
+            score = max(
+                (
+                    text_similarity(
+                        normalized_filename,
+                        re.sub(r"[^a-z0-9]+", " ", self._transliterate(alias)).strip(),
+                    )
+                    for alias in aliases
+                    if alias
+                ),
+                default=0.0,
+            )
+            ranked.append((score, str(concept["id"])))
+        if ranked and max(ranked)[0] >= 0.42:
+            concept_id = max(ranked)[1]
+            signature_to_concept[signature] = concept_id
+            return concept_id, str(by_id[concept_id]["label"])
+
+        direct_targets = (self._spec.metadata if self._spec else {}).get(
+            "direct_concept_question_ids", {}
+        )
+        candidates = {
+            concept_id
+            for question_id in observed_expected_ids
+            for concept_id in direct_targets.get(question_id, [])
+        }
+        if not candidates:
+            candidates = set(by_id)
+        already_used = set(signature_to_concept.values())
+        concept_id = next(
+            (item for item in sorted(candidates) if item not in already_used),
+            next(iter(sorted(candidates)), None),
+        )
+        if concept_id:
+            signature_to_concept[signature] = concept_id
+            return concept_id, str(by_id[concept_id]["label"])
+        return None, None
+
+    async def _assigned_inventory(
+        self,
+        page,
+        platform_to_expected: dict[str, str],
+    ) -> tuple[list[dict], list[str], list[str]]:
+        payloads_by_id: dict[str, dict] = {}
+        media_urls: list[str] = []
+        warnings: list[str] = []
+        direct_expected_ids: list[str] = []
+
+        async def capture() -> None:
+            for payload in await page.evaluate(EXTRACT_QUESTIONS_JS):
+                platform_id = str(payload.get("platform_id", ""))
+                if platform_id:
+                    payloads_by_id[platform_id] = payload
+                media_urls.extend(str(value) for value in payload.get("media_urls", []) if value)
+
+        await capture()
+        fast_move = page.locator("#fastMoveSelect")
+        if await fast_move.count():
+            options = await fast_move.locator("option").evaluate_all(
+                "els => els.map(o => ({value:o.value, text:(o.textContent||'').trim(), disabled:o.disabled})).filter(o => o.value && !o.disabled)"
+            )
+            current_value = await fast_move.input_value()
+            visible_ids = set(payloads_by_id)
+            visible_group_ids = {
+                str(payload.get("group_id"))
+                for payload in payloads_by_id.values()
+                if payload.get("group_id")
+            }
+            current_index = next(
+                (
+                    index
+                    for index, option in enumerate(options)
+                    if str(option["value"]) in visible_ids | visible_group_ids
+                ),
+                -1,
+            )
+            if current_index < 0:
+                current_index = next(
+                    (
+                        index
+                        for index, option in enumerate(options)
+                        if str(option["value"]) == str(current_value)
+                    ),
+                    0,
+                )
+            # Do not jump back into the screener after the random monad has
+            # been assigned: some Enjoy projects recalculate/reset variables
+            # on such a backward jump. Only inventory the concept/main block.
+            options = options[current_index:]
+            expected_by_id = {
+                question.id: question for question in (self._spec.questions if self._spec else [])
+            }
+            direct_targets = (self._spec.metadata if self._spec else {}).get(
+                "direct_concept_question_ids", {}
+            )
+
+            def stems(value: str) -> set[str]:
+                return {
+                    token[:4]
+                    for token in re.findall(r"[a-zа-яё]+", value.lower())
+                    if len(token) >= 5
+                }
+
+            for question_id in direct_targets:
+                question = expected_by_id.get(question_id)
+                if not question:
+                    continue
+                expected_stems = stems(question.text)
+                ranked = sorted(
+                    (
+                        (
+                            len(expected_stems & stems(str(option.get("text", "")))),
+                            option,
+                        )
+                        for option in options
+                    ),
+                    key=lambda item: item[0],
+                    reverse=True,
+                )
+                if not ranked or ranked[0][0] < 1:
+                    continue
+                option = ranked[0][1]
+                try:
+                    await fast_move.select_option(
+                        str(option["value"]), timeout=min(self.timeout_ms, 3_000)
+                    )
+                    await page.wait_for_timeout(350)
+                    selected_value = await fast_move.input_value()
+                    screen_payloads = await page.evaluate(EXTRACT_QUESTIONS_JS)
+                    visible_ids = {
+                        str(payload.get("platform_id", "")) for payload in screen_payloads
+                    }
+                    visible_group_ids = {
+                        str(payload.get("group_id", "")) for payload in screen_payloads
+                    }
+                    if (
+                        selected_value == str(option["value"])
+                        or str(option["value"]) in visible_ids | visible_group_ids
+                    ):
+                        direct_expected_ids.append(question_id)
+                    for payload in screen_payloads:
+                        platform_id = str(payload.get("platform_id", ""))
+                        if platform_id:
+                            payloads_by_id[platform_id] = payload
+                except Exception:
+                    continue
+            for option in options:
+                try:
+                    await fast_move.select_option(
+                        str(option["value"]), timeout=min(self.timeout_ms, 3_000)
+                    )
+                    # The change event is synchronous but the SPA paints the
+                    # replacement screen on the next ticks. A fixed settle is
+                    # faster and more predictable than waiting on the select
+                    # value, which can legally stay unchanged for group aliases.
+                    await page.wait_for_timeout(350)
+                    await capture()
+                except Exception:
+                    # A filtered debug entry may disappear after another
+                    # jump. This is expected for branch-only questions; the
+                    # explicit concept-presence comparison below decides
+                    # whether a real questionnaire error exists.
+                    continue
+        platform_to_expected.update(
+            self._payload_expected_map(list(payloads_by_id.values()))
+        )
+        expected_ids: list[str] = []
+        for payload in payloads_by_id.values():
+            platform_id = str(payload.get("platform_id", ""))
+            group_id = str(payload.get("group_id") or "")
+            expected_id = platform_to_expected.get(platform_id)
+            if not expected_id and group_id:
+                expected_id = next(
+                    (
+                        value
+                        for child_id, value in platform_to_expected.items()
+                        if self.group_by_question_id.get(child_id) == group_id
+                    ),
+                    None,
+                )
+            if expected_id and expected_id not in expected_ids:
+                expected_ids.append(expected_id)
+        expected_ids = list(dict.fromkeys(expected_ids + direct_expected_ids))
+        return list(payloads_by_id.values()), list(dict.fromkeys(media_urls)), warnings
+
+    async def _probe_concept_once(
+        self,
+        browser,
+        url: str,
+        attempt: int,
+        platform_to_expected: dict[str, str],
+        answer_code_map: dict[str, dict[str, str]],
+        known_signatures: set[str],
+        signature_to_concept: dict[str, str],
+    ) -> ConceptRun | None:
+        if not self._spec:
+            return None
+        context = await self._new_context(browser, url)
+        page = await context.new_page()
+        page.set_default_timeout(self.timeout_ms)
+        warnings: list[str] = []
+        try:
+            response = await page.goto(url, wait_until="domcontentloaded")
+            if response and response.status >= 400:
+                warnings.append(f"HTTP {response.status} при создании прохождения")
+                return None
+            await page.wait_for_selector(
+                VISIBLE_LEAF_QUESTION_SELECTOR,
+                state="attached",
+                timeout=self.timeout_ms,
+            )
+            media_urls: list[str] = []
+            for _ in range(45):
+                if "status=2" in page.url:
+                    warnings.append("Скринер завершил тестового респондента до показа концепции.")
+                    return ConceptRun(
+                        attempt=attempt,
+                        signature=f"screenout-{attempt}",
+                        warnings=warnings,
+                    )
+                payloads = await page.evaluate(EXTRACT_QUESTIONS_JS)
+                media_urls.extend(
+                    str(value)
+                    for payload in payloads
+                    for value in payload.get("media_urls", [])
+                    if value
+                )
+                # Screening screens in the supported questionnaires do not
+                # contain respondent-facing media. The first non-empty media
+                # URL is therefore the stable concept assignment signal and
+                # avoids walking the whole main questionnaire.
+                if media_urls:
+                    break
+                containers = page.locator(VISIBLE_LEAF_QUESTION_SELECTOR)
+                for index in range(await containers.count()):
+                    container = containers.nth(index)
+                    platform_id = await container.get_attribute("data-question-id") or ""
+                    group_id = await container.evaluate(
+                        """q => { const g=q.parentElement&&q.parentElement.closest('.question-container[data-question-id]'); return g ? (g.getAttribute('data-question-id')||'') : ''; }"""
+                    )
+                    expected_id = self._expected_id_for_runtime_container(
+                        platform_id,
+                        str(group_id or ""),
+                        platform_to_expected,
+                        {
+                            self.group_by_question_id[child]: expected
+                            for child, expected in platform_to_expected.items()
+                            if child in self.group_by_question_id
+                        },
+                    )
+                    await self._answer_container(
+                        container,
+                        expected_id,
+                        self._baseline_assignments,
+                        answer_code_map,
+                    )
+                next_button = page.locator(
+                    '#nextSurvey, [data-testid="next"], button:has-text("Вперед"), button:has-text("Далее")'
+                ).first
+                if not await next_button.count() or not await next_button.is_visible():
+                    warnings.append("Не найдена кнопка перехода до экрана концепции.")
+                    return ConceptRun(
+                        attempt=attempt,
+                        signature=f"incomplete-{attempt}",
+                        warnings=warnings,
+                    )
+                before = await page.locator(VISIBLE_LEAF_QUESTION_SELECTOR).evaluate_all(
+                    "els => els.map(q => q.getAttribute('data-question-id')).join('|')"
+                )
+                await next_button.click()
+                try:
+                    await page.wait_for_function(
+                        "before => Array.from(document.querySelectorAll('.question-container[data-question-id]')).filter(q => !q.querySelector('.question-container[data-question-id]')).map(q => q.getAttribute('data-question-id')).join('|') !== before",
+                        arg=before,
+                        timeout=min(self.timeout_ms, 8_000),
+                    )
+                except Exception:
+                    pass
+                await page.wait_for_timeout(250)
+
+            media_urls = list(dict.fromkeys(media_urls))
+            if not media_urls:
+                warnings.append("Платформа не отдала изображение/идентификатор выпавшей концепции.")
+                return ConceptRun(
+                    attempt=attempt,
+                    signature=f"unknown-{attempt}",
+                    warnings=warnings,
+                )
+            signature = hashlib.sha256("\n".join(sorted(media_urls)).encode("utf-8")).hexdigest()[:16]
+            inventory_payloads: list[dict] = []
+            expected_ids: list[str] = []
+            concept_id, concept_label = self._concept_from_media(
+                media_urls,
+                expected_ids,
+                signature_to_concept,
+                signature,
+            )
+            if signature not in known_signatures:
+                (
+                    inventory_payloads,
+                    inventory_media,
+                    expected_ids,
+                    inventory_warnings,
+                ) = await self._walk_assigned_concept(
+                    page,
+                    concept_id,
+                    platform_to_expected,
+                    answer_code_map,
+                )
+                media_urls = list(dict.fromkeys(media_urls + inventory_media))
+                warnings.extend(inventory_warnings)
+            if concept_id and concept_id not in self._concept_sessions:
+                self._concept_sessions[concept_id] = (page.url, await context.storage_state())
+            return ConceptRun(
+                attempt=attempt,
+                signature=signature,
+                concept_id=concept_id,
+                concept_label=concept_label,
+                media_urls=media_urls,
+                observed_expected_ids=expected_ids,
+                observed_questions=[
+                    self._convert(payload, index)
+                    for index, payload in enumerate(inventory_payloads)
+                ],
+                warnings=list(dict.fromkeys(warnings)),
+            )
+        except Exception as exc:
+            return ConceptRun(
+                attempt=attempt,
+                signature=f"error-{attempt}",
+                warnings=[f"Проверка концепции остановлена: {type(exc).__name__}: {exc}"],
+            )
+        finally:
+            await self._close_context(context, url)
+
+    async def _walk_assigned_concept(
+        self,
+        page,
+        concept_id: str | None,
+        platform_to_expected: dict[str, str],
+        answer_code_map: dict[str, dict[str, str]],
+    ) -> tuple[list[dict], list[str], list[str], list[str]]:
+        """Walk the real respondent path through concept-specific questions."""
+        if not self._spec:
+            return [], [], [], []
+        direct_targets = self._spec.metadata.get("direct_concept_question_ids", {})
+        target_ids = {
+            question_id
+            for question_id, concept_ids in direct_targets.items()
+            if not concept_id or concept_id in concept_ids
+        }
+        target_ids.update(self._spec.metadata.get("dynamic_concept_question_ids", []))
+        expected_positions = {
+            question.id: index for index, question in enumerate(self._spec.questions)
+        }
+        stop_position = max(
+            (expected_positions.get(question_id, -1) for question_id in target_ids),
+            default=-1,
+        )
+        payloads_by_id: dict[str, dict] = {}
+        expected_ids: list[str] = []
+        media_urls: list[str] = []
+        warnings: list[str] = []
+        group_to_expected: dict[str, str] = {}
+
+        for _ in range(18):
+            if "status=2" in page.url:
+                warnings.append("Основной блок неожиданно завершился до проверки вопросов концепции.")
+                break
+            screen_payloads = await page.evaluate(EXTRACT_QUESTIONS_JS)
+            screen_map = self._payload_expected_map(screen_payloads)
+            platform_to_expected.update(screen_map)
+            for child_id, expected_id in platform_to_expected.items():
+                group_id = self.group_by_question_id.get(child_id)
+                if group_id:
+                    group_to_expected[group_id] = expected_id
+            screen_positions: list[int] = []
+            for payload in screen_payloads:
+                platform_id = str(payload.get("platform_id", ""))
+                if platform_id:
+                    payloads_by_id[platform_id] = payload
+                media_urls.extend(str(value) for value in payload.get("media_urls", []) if value)
+                expected_id = platform_to_expected.get(platform_id)
+                if expected_id and expected_id not in expected_ids:
+                    expected_ids.append(expected_id)
+                if expected_id in expected_positions:
+                    screen_positions.append(expected_positions[expected_id])
+
+            if screen_positions and stop_position >= 0 and min(screen_positions) > stop_position:
+                break
+
+            containers = page.locator(VISIBLE_LEAF_QUESTION_SELECTOR)
+            if not await containers.count():
+                break
+            for index in range(await containers.count()):
+                container = containers.nth(index)
+                platform_id = await container.get_attribute("data-question-id") or ""
+                group_id = await container.evaluate(
+                    """q => { const g=q.parentElement&&q.parentElement.closest('.question-container[data-question-id]'); return g ? (g.getAttribute('data-question-id')||'') : ''; }"""
+                )
+                expected_id = self._expected_id_for_runtime_container(
+                    platform_id,
+                    str(group_id or ""),
+                    platform_to_expected,
+                    group_to_expected,
+                )
+                await self._answer_container(
+                    container,
+                    expected_id,
+                    self._baseline_assignments,
+                    answer_code_map,
+                )
+            survey_root = page.locator(".es__root").first
+            if await survey_root.count():
+                await self._fill_text_fields(survey_root)
+            next_button = page.locator(
+                '#nextSurvey, [data-testid="next"], button:has-text("Вперед"), button:has-text("Далее")'
+            ).first
+            if not await next_button.count() or not await next_button.is_visible():
+                break
+            before = await page.locator(VISIBLE_LEAF_QUESTION_SELECTOR).evaluate_all(
+                "els => els.map(q => q.getAttribute('data-question-id')).join('|')"
+            )
+            await next_button.click()
+            try:
+                await page.wait_for_function(
+                    "before => Array.from(document.querySelectorAll('.question-container[data-question-id]')).filter(q => !q.querySelector('.question-container[data-question-id]')).map(q => q.getAttribute('data-question-id')).join('|') !== before",
+                    arg=before,
+                    timeout=min(self.timeout_ms, 8_000),
+                )
+            except Exception:
+                validation = " ".join(await page.locator(
+                    '.question-error-message:visible, [data-testid="errors"]:visible, [role="alert"]:visible'
+                ).all_inner_texts()).strip()
+                warnings.append(
+                    f"Платформа не приняла ответ в основном блоке: {validation or 'экран не изменился'}"
+                )
+                break
+            await page.wait_for_timeout(250)
+
+        return (
+            list(payloads_by_id.values()),
+            list(dict.fromkeys(media_urls)),
+            expected_ids,
+            list(dict.fromkeys(warnings)),
+        )
 
     async def discover(self, url: str) -> ObservedSurvey:
         try:
@@ -412,6 +1073,9 @@ class EnjoySurveyAdapter(PlatformAdapter):
         option_samples: dict[str, list[list[str]]] = {}
         row_samples: dict[str, list[list[str]]] = {}
         question_order_samples: list[list[str]] = []
+        all_payloads_by_id: dict[str, dict] = {}
+        concept_runs: list[ConceptRun] = []
+        concept_attempts = 0
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(**self._launch_options())
             try:
@@ -423,6 +1087,7 @@ class EnjoySurveyAdapter(PlatformAdapter):
                         platform_id = str(payload.get("platform_id", ""))
                         if not platform_id:
                             continue
+                        all_payloads_by_id[platform_id] = payload
                         run_order.append(platform_id)
                         option_samples.setdefault(platform_id, []).append(
                             [str(option.get("code", "")) for option in payload.get("options", [])]
@@ -434,6 +1099,52 @@ class EnjoySurveyAdapter(PlatformAdapter):
                             questions.append(self._convert(payload, len(questions)))
                     if run_order:
                         question_order_samples.append(run_order)
+
+                concepts = list((self._spec.metadata if self._spec else {}).get("concepts", []))
+                if concepts:
+                    structural_payloads = list(all_payloads_by_id.values())
+                    platform_to_expected = self._payload_expected_map(structural_payloads)
+                    answer_code_map = self._probe_answer_code_map(
+                        structural_payloads, platform_to_expected
+                    )
+                    known_signatures: set[str] = set()
+                    signature_to_concept: dict[str, str] = {}
+                    expected_ids = {str(item["id"]) for item in concepts}
+                    for attempt in range(1, self.concept_attempt_limit + 1):
+                        concept_attempts = attempt
+                        run = await self._probe_concept_once(
+                            browser,
+                            url,
+                            attempt,
+                            platform_to_expected,
+                            answer_code_map,
+                            known_signatures,
+                            signature_to_concept,
+                        )
+                        if run:
+                            concept_runs.append(run)
+                            warnings.extend(run.warnings)
+                            if not run.signature.startswith(("error-", "unknown-", "screenout-", "incomplete-")):
+                                known_signatures.add(run.signature)
+                        covered = {
+                            item.concept_id for item in concept_runs if item.concept_id
+                        }
+                        if expected_ids.issubset(covered):
+                            break
+                    covered = {
+                        item.concept_id for item in concept_runs if item.concept_id
+                    }
+                    missing = [
+                        str(item["label"])
+                        for item in concepts
+                        if str(item["id"]) not in covered
+                    ]
+                    if missing:
+                        warnings.append(
+                            "Не все случайные концепции встретились за "
+                            f"{concept_attempts} новых прохождений: {', '.join(missing)}. "
+                            "Проверка этих концепций не считается выполненной."
+                        )
             finally:
                 await browser.close()
         for question in questions:
@@ -444,6 +1155,8 @@ class EnjoySurveyAdapter(PlatformAdapter):
             source_url=url,
             questions=questions,
             question_order_samples=question_order_samples,
+            concept_runs=concept_runs,
+            concept_attempts=concept_attempts,
             warnings=list(dict.fromkeys(warnings)),
         )
 
@@ -596,6 +1309,24 @@ class EnjoySurveyAdapter(PlatformAdapter):
         observed_questions: list[ObservedQuestion] = []
         warnings: list[str] = []
         completed = False
+        concept_session = next(
+            (
+                self._concept_sessions[concept_id]
+                for concept_id in scenario.concept_ids
+                if concept_id in self._concept_sessions
+            ),
+            None,
+        )
+        route_url = concept_session[0] if concept_session else url
+        if scenario.concept_ids and not concept_session:
+            return ScenarioResult(
+                scenario_id=scenario.id,
+                completed=False,
+                warnings=[
+                    "Ни одна подходящая случайная концепция не встретилась; "
+                    "логика этого вопроса не проверена."
+                ],
+            )
 
         def route_is_proven() -> bool:
             if any(target in visited_expected for target in scenario.expected_hidden):
@@ -620,7 +1351,11 @@ class EnjoySurveyAdapter(PlatformAdapter):
 
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(**self._launch_options())
-            context = await self._new_context(browser, url)
+            context = (
+                await browser.new_context(locale="ru-RU", storage_state=concept_session[1])
+                if concept_session
+                else await self._new_context(browser, route_url)
+            )
             page = await context.new_page()
             page.set_default_timeout(self.timeout_ms)
             try:
@@ -632,10 +1367,10 @@ class EnjoySurveyAdapter(PlatformAdapter):
                 # by POSTing to /goto/. Do the same for the nearest controller.
                 if (
                     preferred_start_id
-                    and url.startswith(("http://", "https://"))
-                    and "/index/" in url
+                    and route_url.startswith(("http://", "https://"))
+                    and "/index/" in route_url
                 ):
-                    jump_url = url.replace("/index/", "/goto/", 1)
+                    jump_url = route_url.replace("/index/", "/goto/", 1)
                     try:
                         await page.set_content(
                             '<form id="survey-qa-jump" method="post"></form>'
@@ -657,9 +1392,9 @@ class EnjoySurveyAdapter(PlatformAdapter):
                             )
                         response = await navigation.value
                     except Exception:
-                        response = await page.goto(url, wait_until="domcontentloaded")
+                        response = await page.goto(route_url, wait_until="domcontentloaded")
                 else:
-                    response = await page.goto(url, wait_until="domcontentloaded")
+                    response = await page.goto(route_url, wait_until="domcontentloaded")
                 if response and response.status >= 400:
                     raise RuntimeError(f"EnjoySurvey вернул HTTP {response.status}")
                 if "/user/login" in page.url:
@@ -946,7 +1681,7 @@ class EnjoySurveyAdapter(PlatformAdapter):
             except Exception as exc:
                 warnings.append(f"Прохождение остановлено: {type(exc).__name__}: {exc}")
             finally:
-                await self._close_context(context, url)
+                await self._close_context(context, route_url)
                 await browser.close()
         return ScenarioResult(
             scenario_id=scenario.id,
