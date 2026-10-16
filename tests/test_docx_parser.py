@@ -266,6 +266,170 @@ class DocxParserTests(unittest.TestCase):
             "Далее мы зададим несколько вопросов о Вашем впечатлении.",
         )
 
+    def test_reads_monadic_catalogue_scoped_questions_and_dynamic_wording(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "concepts.docx"
+            document = Document()
+            document.add_paragraph("Каждый респондент случайно видит только одну концепцию")
+            document.add_paragraph("ЕСЛИ тестируется Прайм Чикен на сырной булочке")
+            document.add_paragraph("Q6.1. Нравится ли Вам булочка?")
+            document.add_paragraph("ЕСЛИ тестируется Прайм Чикен на вафле (v2-3)")
+            document.add_paragraph("Q6.2. Нравится ли Вам вафля?")
+            document.add_paragraph("ЕСЛИ Q6.2=1-3")
+            document.add_paragraph("Q7. Почему не понравилась вафля?")
+            document.add_paragraph("Формулировка в зависимости от концепта")
+            document.add_paragraph("Q8. Оцените основу (булочке или вафле)")
+            document.save(path)
+
+            spec = DocxSurveyParser().parse(path)
+
+        self.assertEqual(len(spec.metadata["concepts"]), 3)
+        self.assertEqual(spec.metadata["direct_concept_question_ids"]["Q6.1"], ["concept-1"])
+        self.assertEqual(
+            spec.metadata["direct_concept_question_ids"]["Q6.2"],
+            ["concept-2", "concept-3"],
+        )
+        by_id = {question.id: question for question in spec.questions}
+        self.assertEqual(by_id["Q7"].concept_ids, ["concept-2", "concept-3"])
+        self.assertEqual(spec.metadata["dynamic_concept_question_ids"], ["Q8"])
+
+    def test_reads_unlabelled_intro_before_concept_image_as_info(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "implicit-info.docx"
+            document = Document()
+            document.add_paragraph(
+                "Представьте, что в меню появилась новая линейка блюд. Сейчас Вы увидите "
+                "ее подробное описание, после чего мы попросим Вас ответить на вопросы."
+            )
+            document.add_paragraph("Показать изображение и описание")
+            document.add_paragraph("Q1. Нравится ли Вам линейка?")
+            document.save(path)
+
+            spec = DocxSurveyParser().parse(path)
+
+        self.assertEqual(spec.questions[0].id, "INFO1")
+        self.assertEqual(spec.questions[0].type, QuestionType.INFO)
+
+    def test_reads_numbered_info_as_info_not_multi(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "numbered-info.docx"
+            document = Document()
+            document.add_paragraph(
+                "INFO1. Сейчас мы покажем несколько названий и зададим несколько вопросов."
+            )
+            document.add_paragraph("Q1. Какое название Вам нравится?")
+            document.add_paragraph("Один ответ")
+            document.save(path)
+
+            spec = DocxSurveyParser().parse(path)
+
+        self.assertEqual(spec.questions[0].id, "INFO1")
+        self.assertEqual(spec.questions[0].type, QuestionType.INFO)
+
+    def test_only_explicit_exclusive_code_is_marked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "exclusive-code.docx"
+            document = Document()
+            document.add_paragraph("S1. Какие места Вы посещали?")
+            document.add_paragraph(
+                "Тип ответа: несколько ответов, ротация кодов 1-7. "
+                "Код 99 «Ничего» — исключающий."
+            )
+            table = document.add_table(rows=1, cols=2)
+            table.rows[0].cells[0].text = "Код"
+            table.rows[0].cells[1].text = "Вариант ответа"
+            for code, text in [("1", "Ресторан"), ("7", "Кафе"), ("99", "Ничего")]:
+                row = table.add_row()
+                row.cells[0].text = code
+                row.cells[1].text = text
+            document.save(path)
+
+            spec = DocxSurveyParser().parse(path)
+
+        self.assertEqual(
+            [(option.code, option.exclusive) for option in spec.questions[0].options],
+            [("1", False), ("7", False), ("99", True)],
+        )
+
+    def test_post_question_show_only_instruction_targets_previous_question(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "post-question-filter.docx"
+            document = Document()
+            document.add_paragraph("B5. Выберите название")
+            document.add_paragraph("Один ответ")
+            document.add_paragraph("B6. Что бы Вы сделали?")
+            document.add_paragraph("Несколько ответов")
+            document.add_paragraph("Показывать только если B5 НЕ равно коду 99")
+            document.add_paragraph("A2. Следующий безусловный вопрос")
+            document.save(path)
+
+            spec = DocxSurveyParser().parse(path)
+
+        by_id = {question.id: question for question in spec.questions}
+        self.assertEqual(len(by_id["B6"].display_rules), 1)
+        self.assertEqual(by_id["A2"].display_rules, [])
+        atom = by_id["B6"].display_rules[0].condition.atoms[0]
+        self.assertEqual((atom.question_id, atom.operator, atom.values), ("B5", "not_in", ["99"]))
+
+    def test_reads_separate_matrix_row_and_column_tables(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sectioned-matrix.docx"
+            document = Document()
+            document.add_paragraph("S5. Насколько Вам подходят эти фразы?")
+            document.add_paragraph(
+                "Тип ответа: матрица. Строки ротировать. Один ответ в каждой строке."
+            )
+            document.add_paragraph("Строки матрицы")
+            rows = document.add_table(rows=1, cols=2)
+            rows.rows[0].cells[0].text = "Код"
+            rows.rows[0].cells[1].text = "Строка"
+            for code, text in [("1", "Первая фраза"), ("2", "Вторая фраза")]:
+                row = rows.add_row()
+                row.cells[0].text = code
+                row.cells[1].text = text
+            document.add_paragraph("Столбцы матрицы")
+            columns = document.add_table(rows=1, cols=2)
+            columns.rows[0].cells[0].text = "Код"
+            columns.rows[0].cells[1].text = "Столбец / шкала"
+            for code, text in [("1", "Совсем не про меня"), ("5", "Полностью про меня")]:
+                row = columns.add_row()
+                row.cells[0].text = code
+                row.cells[1].text = text
+
+            document.add_paragraph("B1. Какие названия подходят характеристикам?")
+            document.add_paragraph(
+                "Тип ответа: матрица с множественным выбором. Строки и столбцы ротировать, "
+                "кроме кода 99. Код 99 исключающий."
+            )
+            document.add_paragraph("Строки")
+            rows = document.add_table(rows=1, cols=2)
+            rows.rows[0].cells[0].text = "Код"
+            rows.rows[0].cells[1].text = "Строка"
+            for code, text in [("1", "Необычное"), ("2", "Скучное")]:
+                row = rows.add_row()
+                row.cells[0].text = code
+                row.cells[1].text = text
+            document.add_paragraph("Столбцы")
+            columns = document.add_table(rows=1, cols=2)
+            columns.rows[0].cells[0].text = "Код"
+            columns.rows[0].cells[1].text = "Столбец / шкала"
+            for code, text in [("1", "Мохито"), ("2", "Мята-Лайм"), ("99", "Ни одно")]:
+                row = columns.add_row()
+                row.cells[0].text = code
+                row.cells[1].text = text
+            document.save(path)
+
+            spec = DocxSurveyParser().parse(path)
+
+        by_id = {question.id: question for question in spec.questions}
+        self.assertEqual(by_id["S5"].type, QuestionType.MATRIX_SINGLE)
+        self.assertEqual([option.text for option in by_id["S5"].options], ["Совсем не про меня", "Полностью про меня"])
+        self.assertEqual([row.text for row in by_id["S5"].matrix_rows], ["Первая фраза", "Вторая фраза"])
+        self.assertEqual(by_id["B1"].type, QuestionType.MATRIX_MULTI)
+        self.assertEqual([option.text for option in by_id["B1"].options], ["Мохито", "Мята-Лайм", "Ни одно"])
+        self.assertEqual([row.text for row in by_id["B1"].matrix_rows], ["Необычное", "Скучное"])
+        self.assertEqual([option.exclusive for option in by_id["B1"].options], [False, False, True])
+
 
 if __name__ == "__main__":
     unittest.main()
