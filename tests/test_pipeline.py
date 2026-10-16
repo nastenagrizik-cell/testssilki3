@@ -153,6 +153,57 @@ class PipelineTests(unittest.TestCase):
             QuestionType.TEXT,
         )
 
+    def test_enjoy_multi_grid_is_converted_to_matrix_multi(self):
+        self.assertEqual(
+            EnjoySurveyAdapter._question_type("type_multi", rows=3, option_count=4),
+            QuestionType.MATRIX_MULTI,
+        )
+
+    def test_enjoy_merges_repeated_children_of_one_matrix_group(self):
+        payloads = [
+            {
+                "platform_id": str(101 + index),
+                "group_id": "100",
+                "text": "Вы можете выбрать для каждой характеристики одно или несколько названий",
+                "raw_type": "type_multi",
+                "options": [
+                    {"code": "1", "text": "Мохито", "exclusive": False, "fixed": False},
+                    {"code": "99", "text": "Ни одно", "exclusive": True, "fixed": False},
+                ],
+                "matrix_rows": [],
+                "rows": 0,
+                "row_order": [],
+            }
+            for index in range(4)
+        ]
+
+        merged = EnjoySurveyAdapter._merge_grouped_matrix_payloads(payloads)
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["platform_id"], "100")
+        self.assertEqual(merged[0]["raw_type"], "type_matrix_multi")
+        self.assertEqual(merged[0]["child_platform_ids"], ["101", "102", "103", "104"])
+
+    def test_enjoy_does_not_merge_distinct_questions_in_one_group(self):
+        payloads = [
+            {
+                "platform_id": "101",
+                "group_id": "100",
+                "text": "Какие названия Вам нравятся?",
+                "raw_type": "type_multi",
+                "options": [{"code": "1", "text": "Мохито"}],
+            },
+            {
+                "platform_id": "102",
+                "group_id": "100",
+                "text": "Какие названия кажутся необычными?",
+                "raw_type": "type_multi",
+                "options": [{"code": "1", "text": "Мохито"}],
+            },
+        ]
+
+        self.assertEqual(len(EnjoySurveyAdapter._merge_grouped_matrix_payloads(payloads)), 2)
+
     def test_maps_screening_code_from_label_in_logic_instruction(self):
         question = QuestionSpec(
             id="S3",
