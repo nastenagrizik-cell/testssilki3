@@ -16,3 +16,5 @@ services:
         value: "1"
       - key: MAX_LOGIC_SCENARIOS
         value: "80"
+      - key: MAX_CONCEPT_ATTEMPTS
+        value: "18"
