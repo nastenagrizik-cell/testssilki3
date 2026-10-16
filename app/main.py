@@ -85,7 +85,10 @@ async def create_job(
 async def get_job(job_id: str) -> JSONResponse:
     job = await jobs.get(job_id)
     if not job:
-        raise HTTPException(404, "Проверка не найдена")
+        raise HTTPException(
+            404,
+            "Сервер был перезапущен во время проверки, поэтому временное задание исчезло",
+        )
     return JSONResponse(asdict(job))
 
 
