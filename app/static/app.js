@@ -35,7 +35,8 @@ function renderReport(jobId, report) {
     <div class="metric"><strong>${report.expected_question_count}</strong><span>вопросов в Word</span></div>
     <div class="metric"><strong>${report.observed_question_count}</strong><span>элементов в ссылке</span></div>
     <div class="metric"><strong>${counts.critical}</strong><span>критических ошибок</span></div>
-    <div class="metric"><strong>${report.scenario_results.length}</strong><span>проверенных маршрутов</span></div>`;
+    <div class="metric"><strong>${report.scenario_results.length}</strong><span>проверенных маршрутов</span></div>
+    ${report.expected_concept_count ? `<div class="metric"><strong>${report.observed_concept_count}/${report.expected_concept_count}</strong><span>покрыто концепций (${report.concept_attempts} прохожд.)</span></div>` : ""}`;
   const issues = document.querySelector("#issues");
   if (!report.issues.length) {
     issues.innerHTML = '<p class="empty">Расхождения не обнаружены.</p>';
