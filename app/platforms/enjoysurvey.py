@@ -234,7 +234,23 @@ class EnjoySurveyAdapter(PlatformAdapter):
         self._baseline_assignments = _baseline_assignments(spec)
 
     def _launch_options(self) -> dict:
-        options: dict = {"headless": self.headless, "args": ["--no-sandbox"]}
+        # Render's free instances have a tight memory limit.  Keeping Chromium
+        # to a small number of renderer processes avoids the service being
+        # killed while a long questionnaire is being inspected.  These flags
+        # do not change page behaviour or the survey extraction rules.
+        options: dict = {
+            "headless": self.headless,
+            "args": [
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--no-first-run",
+                "--no-zygote",
+                "--renderer-process-limit=2",
+            ],
+        }
         if self.browser_executable_path:
             options["executable_path"] = self.browser_executable_path
         return options
