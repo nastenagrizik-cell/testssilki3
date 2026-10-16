@@ -148,7 +148,21 @@ class SurveyStudioAdapter(PlatformAdapter):
         self.browser_executable_path = os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE") or None
 
     def _launch_options(self) -> dict:
-        options: dict = {"headless": self.headless, "args": ["--no-sandbox"]}
+        # Use the same low-memory Chromium profile as the Enjoy adapter so a
+        # long audit stays within the limits of a small Render instance.
+        options: dict = {
+            "headless": self.headless,
+            "args": [
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--no-first-run",
+                "--no-zygote",
+                "--renderer-process-limit=2",
+            ],
+        }
         if self.browser_executable_path:
             options["executable_path"] = self.browser_executable_path
         return options
