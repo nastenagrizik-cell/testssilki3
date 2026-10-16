@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 
-from .models import ConditionAtom, LogicRule, SurveySpec, TestScenario
+from .models import ConditionAtom, LogicRule, QuestionType, SurveySpec, TestScenario
 
 
 def _first_value(atom: ConditionAtom, truth: bool) -> str:
@@ -48,6 +48,7 @@ def _scenario(
     question_text: str,
     should_show: bool,
     rule: LogicRule,
+    concept_ids: list[str] | None = None,
 ) -> TestScenario:
     return TestScenario(
         id=scenario_id,
@@ -56,6 +57,7 @@ def _scenario(
         expected_visible=[question_id] if should_show else [],
         expected_hidden=[] if should_show else [question_id],
         expected_texts={question_id: question_text},
+        concept_ids=concept_ids or [],
         source_rule=rule.raw_text,
     )
 
@@ -84,6 +86,22 @@ def _baseline_assignments(spec: SurveySpec) -> dict[str, list[str]]:
             if assigned_questions & rule_questions:
                 continue
             _apply_condition(baseline, rule, False)
+    # A downstream single-choice question can display only options selected
+    # in an earlier multi-choice question. Selecting a safe downstream code
+    # therefore requires selecting the same code in its source first.
+    for target_id, source_id in spec.metadata.get("piped_options", {}).items():
+        if target_id in baseline:
+            baseline[source_id] = list(baseline[target_id])
+    for index, target in enumerate(spec.questions[1:], start=1):
+        if target.id not in baseline or target.type != QuestionType.SINGLE:
+            continue
+        source = spec.questions[index - 1]
+        if source.type != QuestionType.MULTI or not source.options or not target.options:
+            continue
+        source_codes = {option.code for option in source.options}
+        target_codes = {option.code for option in target.options}
+        if target_codes.issubset(source_codes) and len(target_codes) >= 3:
+            baseline[source.id] = list(baseline[target.id])
     return baseline
 
 
@@ -94,6 +112,7 @@ def _consolidate_scenarios(scenarios: list[TestScenario]) -> list[TestScenario]:
         assignment_key = tuple(
             sorted((question_id, tuple(values)) for question_id, values in scenario.assignments.items())
         )
+        concept_key = tuple(sorted(scenario.concept_ids))
         target = None
         for candidate in groups:
             candidate_key = tuple(
@@ -103,7 +122,8 @@ def _consolidate_scenarios(scenarios: list[TestScenario]) -> list[TestScenario]:
                 set(candidate.expected_visible) & set(scenario.expected_hidden)
                 or set(candidate.expected_hidden) & set(scenario.expected_visible)
             )
-            if candidate_key == assignment_key and not conflicts:
+            candidate_concept_key = tuple(sorted(candidate.concept_ids))
+            if candidate_key == assignment_key and candidate_concept_key == concept_key and not conflicts:
                 target = candidate
                 break
         if target is None:
@@ -175,6 +195,7 @@ def build_scenarios(spec: SurveySpec, limit: int | None = 80) -> list[TestScenar
                         question_text=question.text,
                         should_show=should_show,
                         rule=rule,
+                        concept_ids=question.concept_ids,
                     )
                 )
             counter += 1
