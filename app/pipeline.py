@@ -182,6 +182,8 @@ async def run_audit(
     survey_url = validate_public_url(survey_url)
     spec = DocxSurveyParser().parse(document_path)
     adapter = adapter_for(survey_url, headless=headless)
+    if isinstance(adapter, EnjoySurveyAdapter):
+        adapter.configure_spec(spec)
     observed = await adapter.discover(survey_url)
     report = compare_surveys(
         spec,
