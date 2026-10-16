@@ -1,14 +1,16 @@
 import unittest
 
 from app.models import (
+    AnswerOption,
     ConditionAtom,
     ConditionGroup,
     LogicRule,
     QuestionSpec,
+    QuestionType,
     SourceLocation,
     SurveySpec,
 )
-from app.planner import build_scenarios
+from app.planner import _baseline_assignments, build_scenarios
 
 
 class PlannerTests(unittest.TestCase):
@@ -175,6 +177,37 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(len(scenarios), 2)
         self.assertEqual(set(scenarios[0].expected_visible), {"Q2", "Q3"})
         self.assertEqual(set(scenarios[1].expected_hidden), {"Q2", "Q3"})
+
+    def test_baseline_selects_source_option_required_by_piped_question(self):
+        options = [
+            AnswerOption(code="1", text="Burger King"),
+            AnswerOption(code="5", text="Другой ресторан"),
+            AnswerOption(code="99", text="Ничего"),
+        ]
+        source = QuestionSpec(
+            id="S3", text="Какие рестораны?", type=QuestionType.MULTI,
+            options=options, source=SourceLocation(block_index=1, kind="paragraph"),
+        )
+        target = QuestionSpec(
+            id="S4", text="Какой чаще всего?", type=QuestionType.SINGLE,
+            options=options, source=SourceLocation(block_index=2, kind="paragraph"),
+        )
+        rule = LogicRule(
+            action="continue",
+            condition=ConditionGroup(atoms=[ConditionAtom(question_id="S4", values=["1"])]),
+            raw_text="Продолжить, если S4=1",
+        )
+        spec = SurveySpec(
+            title="Тест",
+            questions=[source, target],
+            rules=[rule],
+            metadata={"piped_options": {"S4": "S3"}},
+        )
+
+        baseline = _baseline_assignments(spec)
+
+        self.assertEqual(baseline["S4"], ["1"])
+        self.assertEqual(baseline["S3"], ["1"])
 
 
 if __name__ == "__main__":
