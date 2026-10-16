@@ -69,6 +69,7 @@ class QuestionSpec(BaseModel):
     required: bool | None = None
     rotation: RotationSpec | None = None
     display_rules: list[LogicRule] = Field(default_factory=list)
+    concept_ids: list[str] = Field(default_factory=list)
     instructions: list[str] = Field(default_factory=list)
     source: SourceLocation
 
@@ -94,11 +95,24 @@ class ObservedQuestion(BaseModel):
     row_order_samples: list[list[str]] = Field(default_factory=list)
 
 
+class ConceptRun(BaseModel):
+    attempt: int
+    signature: str
+    concept_id: str | None = None
+    concept_label: str | None = None
+    media_urls: list[str] = Field(default_factory=list)
+    observed_expected_ids: list[str] = Field(default_factory=list)
+    observed_questions: list[ObservedQuestion] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
 class ObservedSurvey(BaseModel):
     platform: str
     source_url: str
     questions: list[ObservedQuestion] = Field(default_factory=list)
     question_order_samples: list[list[str]] = Field(default_factory=list)
+    concept_runs: list[ConceptRun] = Field(default_factory=list)
+    concept_attempts: int = 0
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -127,6 +141,7 @@ class TestScenario(BaseModel):
     expected_visible: list[str] = Field(default_factory=list)
     expected_hidden: list[str] = Field(default_factory=list)
     expected_texts: dict[str, str] = Field(default_factory=dict)
+    concept_ids: list[str] = Field(default_factory=list)
     source_rule: str | None = None
 
 
@@ -146,6 +161,9 @@ class ComparisonReport(BaseModel):
     source_url: str
     expected_question_count: int
     observed_question_count: int
+    expected_concept_count: int = 0
+    observed_concept_count: int = 0
+    concept_attempts: int = 0
     matches: list[QuestionMatch] = Field(default_factory=list)
     issues: list[Issue] = Field(default_factory=list)
     scenarios: list[TestScenario] = Field(default_factory=list)
