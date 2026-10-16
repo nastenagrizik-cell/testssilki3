@@ -37,6 +37,9 @@ TECHNICAL_TEXT_PATTERNS = (
     r"\bЗАПИШИТЕ(?:\s*,?\s*ПОЖАЛУЙСТА\s*,?)?\s+ПОДРОБНО\b\.?",
     r"\([^)]*\bВЫВЕСТИ\b[^)]*\)",
     r"\bВЫВЕСТИ\s+КОД\s+ПРОДУКТА\s*,?\s*ВЫБРАННОГО\s+В\s+[A-ZА-ЯЁ]+\d+(?:[._]\d+)*",
+    r"\b(?:ВЫБЕРИТЕ|УКАЖИТЕ)\s+(?:МИНИМУМ|НЕ\s+МЕНЕЕ|НЕ\s+БОЛЕЕ|МАКСИМУМ|РОВНО)\s+\d+\s+(?:ВАРИАНТ\w*|ОТВЕТ\w*)(?:\s*\([^)]*\))?\.?",
+    r"\b(?:МИНИМУМ|МАКСИМУМ)\s+\d+\s+(?:ВАРИАНТ\w*|ОТВЕТ\w*)(?:\s*\([^)]*\))?\.?",
+    r"\bОЦЕНИТЕ\s+(?:КАЖД\w+\s+)?(?:ПО\s+)?ШКАЛЕ\s+ОТ\s+\d+\s+ДО\s+\d+\s*,?\s+ГДЕ\b.+$",
 )
 
 
@@ -47,7 +50,22 @@ def _clean_question_text(value: str) -> str:
     return normalize_space(result).strip(" .")
 
 
+def _dynamic_concept_variants(value: str) -> list[str]:
+    """Expand Word placeholders such as ``(булочке или вафле)``."""
+    match = re.search(r"\(([^()]+?)\s+ИЛИ\s+([^()]+?)\)", value, flags=re.I)
+    if not match:
+        return [value]
+    return list(dict.fromkeys([
+        value,
+        f"{value[:match.start()]}({match.group(1).strip()}){value[match.end():]}",
+        f"{value[:match.start()]}({match.group(2).strip()}){value[match.end():]}",
+    ]))
+
+
 def _question_text_score(expected: str, actual: str) -> float:
+    variants = _dynamic_concept_variants(expected)
+    if len(variants) > 1:
+        return max(_question_text_score(value, actual) for value in variants[1:])
     cleaned_expected = _clean_question_text(expected)
     cleaned_actual = _clean_question_text(actual)
     left = normalize_text(cleaned_expected)
@@ -440,6 +458,132 @@ def _is_standard_platform_demographic(text: str) -> bool:
     return any(value == pattern or value.startswith(f"{pattern} ") for pattern in patterns)
 
 
+def _compare_concepts(
+    spec: SurveySpec,
+    observed: ObservedSurvey,
+    matches: list[QuestionMatch],
+    issues: list[Issue],
+) -> tuple[int, int]:
+    concepts = list(spec.metadata.get("concepts", []))
+    if not concepts:
+        return 0, 0
+    expected_ids = {str(item["id"]) for item in concepts}
+    observed_ids = {
+        run.concept_id for run in observed.concept_runs if run.concept_id in expected_ids
+    }
+    missing_labels = [
+        str(item["label"])
+        for item in concepts
+        if str(item["id"]) not in observed_ids
+    ]
+    if missing_labels:
+        issues.append(
+            Issue(
+                code="concept_coverage_incomplete",
+                severity="warning",
+                title="Не все случайные концепции встретились",
+                expected=f"Проверить концепций: {len(concepts)}",
+                actual=(
+                    f"Встретилось: {len(observed_ids)} за {observed.concept_attempts} прохождений. "
+                    f"Не проверены: {', '.join(missing_labels)}"
+                ),
+                evidence={"missing_concepts": missing_labels},
+            )
+        )
+
+    direct_targets: dict[str, list[str]] = spec.metadata.get(
+        "direct_concept_question_ids", {}
+    )
+    complete_runs = {
+        run.concept_id: run
+        for run in observed.concept_runs
+        if run.concept_id and run.observed_expected_ids
+    }
+    for question_id, target_concepts in direct_targets.items():
+        for concept in concepts:
+            concept_id = str(concept["id"])
+            run = complete_runs.get(concept_id)
+            if not run:
+                continue
+            present = question_id in run.observed_expected_ids
+            should_be_present = concept_id in target_concepts
+            if should_be_present and not present:
+                issues.append(
+                    Issue(
+                        code="concept_question_missing",
+                        severity="critical",
+                        title="Вопрос не найден в предназначенной для него концепции",
+                        expected=f"{question_id} должен задаваться для «{concept['label']}»",
+                        actual="Вопрос отсутствует в прохождении этой концепции",
+                        question_id=question_id,
+                        evidence={"concept_id": concept_id, "attempt": run.attempt},
+                    )
+                )
+            elif not should_be_present and present:
+                issues.append(
+                    Issue(
+                        code="concept_question_extra",
+                        severity="critical",
+                        title="Вопрос появился в неподходящей концепции",
+                        expected=f"{question_id} не должен задаваться для «{concept['label']}»",
+                        actual="Вопрос присутствует в прохождении этой концепции",
+                        question_id=question_id,
+                        evidence={"concept_id": concept_id, "attempt": run.attempt},
+                    )
+                )
+
+    platform_to_expected = {match.observed_id: match.expected_id for match in matches}
+    expected_by_id = {question.id: question for question in spec.questions}
+    dynamic_ids = set(spec.metadata.get("dynamic_concept_question_ids", []))
+    checked: set[tuple[str, str]] = set()
+    for run in complete_runs.values():
+        for actual in run.observed_questions:
+            expected_id = platform_to_expected.get(actual.platform_id)
+            expected = expected_by_id.get(expected_id or "")
+            if not expected or not run.concept_id:
+                continue
+            if expected.id not in dynamic_ids and not expected.concept_ids:
+                continue
+            if expected.concept_ids and run.concept_id not in expected.concept_ids:
+                continue
+            key = (run.concept_id, expected.id)
+            if key in checked:
+                continue
+            checked.add(key)
+            before = len(issues)
+            score = _question_text_score(expected.text, actual.text)
+            if score < 0.86:
+                issues.append(
+                    Issue(
+                        code="concept_question_text_mismatch",
+                        severity="major" if score < 0.65 else "minor",
+                        title="Формулировка вопроса отличается в конкретной концепции",
+                        expected=expected.text,
+                        actual=actual.text,
+                        question_id=expected.id,
+                        evidence={"concept_id": run.concept_id, "similarity": score},
+                    )
+                )
+            if not _types_match(expected.type, actual.type):
+                issues.append(
+                    Issue(
+                        code="concept_question_type_mismatch",
+                        severity="major",
+                        title="Тип вопроса не совпадает в конкретной концепции",
+                        expected=expected.type.value,
+                        actual=actual.type.value,
+                        question_id=expected.id,
+                        evidence={"concept_id": run.concept_id},
+                    )
+                )
+            _compare_options(expected, actual, issues)
+            _compare_matrix_rows(expected, actual, issues)
+            for issue in issues[before:]:
+                issue.evidence.setdefault("concept_id", run.concept_id)
+                issue.evidence.setdefault("concept_label", run.concept_label)
+    return len(concepts), len(observed_ids)
+
+
 def compare_surveys(
     spec: SurveySpec,
     observed: ObservedSurvey,
@@ -639,6 +783,10 @@ def compare_surveys(
             )
         )
 
+    expected_concept_count, observed_concept_count = _compare_concepts(
+        spec, observed, matches, issues
+    )
+
     return ComparisonReport(
         created_at=datetime.now(UTC).isoformat(),
         document_title=spec.title,
@@ -646,6 +794,9 @@ def compare_surveys(
         source_url=observed.source_url,
         expected_question_count=len(spec.questions),
         observed_question_count=len(observed.questions),
+        expected_concept_count=expected_concept_count,
+        observed_concept_count=observed_concept_count,
+        concept_attempts=observed.concept_attempts,
         matches=matches,
         issues=issues,
         parser_warnings=spec.warnings,
