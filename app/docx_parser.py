@@ -19,7 +19,7 @@ from .models import (
     SourceLocation,
     SurveySpec,
 )
-from .normalization import normalize_id, normalize_space
+from .normalization import normalize_id, normalize_space, normalize_text, parse_code_list, text_similarity
 
 
 QUESTION_ID_TOKEN = r"[A-Za-zА-Яа-яЁё]{1,5}\d+(?:[._]\d+|[A-Za-zА-Яа-яЁё]+)*"
@@ -244,6 +244,181 @@ def _info_from_block(block: Block) -> str | None:
     return text if any(char.isalpha() for char in text) else None
 
 
+def _implicit_info_from_blocks(blocks: list[Block], position: int) -> str | None:
+    """Recognize an unlabelled respondent intro that explicitly precedes a concept image."""
+    block = blocks[position]
+    if block.kind != "paragraph" or len(block.text) < 80:
+        return None
+    following = " ".join(
+        item.text for item in blocks[position + 1:position + 3] if item.kind == "paragraph"
+    ).upper().replace("Ё", "Е")
+    if not re.search(r"ПОКАЗАТЬ\s+(?:ИЗОБРАЖЕНИЕ|ОПИСАНИЕ)", following):
+        return None
+    upper = block.text.upper().replace("Ё", "Е")
+    if not upper.startswith(("ПРЕДСТАВЬТЕ", "СЕЙЧАС ВЫ УВИДИТЕ", "МЫ ПРОВОДИМ ИССЛЕДОВАНИЕ")):
+        return None
+    return block.text
+
+
+def _concept_metadata(
+    blocks: list[Block],
+    questions: list[QuestionSpec],
+    question_positions: list[tuple[int, QuestionSpec]],
+) -> dict[str, object]:
+    """Extract monadic concepts and concept-specific questions from natural Word notes."""
+    rotation_text = next(
+        (
+            block.text
+            for block in blocks
+            if re.search(r"СЛУЧАЙН\w*\s+ВИДИТ\s+ТОЛЬКО\s+ОДН\w*\s+КОНЦЕП", block.text, re.I)
+        ),
+        "",
+    )
+    if not rotation_text:
+        return {}
+
+    quoted = [normalize_space(value) for value in re.findall(r"«([^»]+)»", rotation_text)]
+    # A questionnaire title can be quoted before the actual list. Keep only
+    # the comma/or-separated catalogue when at least two names are present.
+    explicit_labels = quoted if len(quoted) >= 2 else []
+    conditions: list[dict[str, object]] = []
+    dynamic_ids: list[str] = []
+    for position, block in enumerate(blocks):
+        condition_match = re.search(
+            r"ЕСЛИ\s+ТЕСТИРУЕТСЯ\s+(.+)$", block.text, flags=re.I
+        )
+        next_question = next(
+            (question for qpos, question in question_positions if qpos > position),
+            None,
+        )
+        if condition_match and next_question:
+            raw_label = normalize_space(condition_match.group(1)).strip(" .;:")
+            version_match = re.search(
+                r"\(\s*[VВ]\s*(\d+)\s*(?:[-–—]\s*(\d+))?\s*\)",
+                raw_label,
+                flags=re.I,
+            )
+            clean_label = normalize_space(
+                re.sub(r"\(\s*[VВ]\s*\d+\s*(?:[-–—]\s*\d+)?\s*\)", "", raw_label, flags=re.I)
+            )
+            versions: list[int] = []
+            if version_match:
+                start = int(version_match.group(1))
+                end = int(version_match.group(2) or start)
+                if start <= end <= start + 20:
+                    versions = list(range(start, end + 1))
+            conditions.append(
+                {
+                    "question_id": next_question.id,
+                    "label": clean_label,
+                    "versions": versions,
+                    "raw_text": block.text,
+                }
+            )
+        if re.search(r"ФОРМУЛИРОВК\w*\s+В\s+ЗАВИСИМОСТИ\s+ОТ\s+КОНЦЕПТ", block.text, re.I):
+            if next_question:
+                dynamic_ids.append(next_question.id)
+
+    concepts: list[dict[str, object]] = []
+    if explicit_labels:
+        concepts = [
+            {"id": f"concept-{index}", "label": label, "aliases": [label]}
+            for index, label in enumerate(explicit_labels, start=1)
+        ]
+    elif conditions:
+        highest_version = max(
+            (version for item in conditions for version in item["versions"]),
+            default=0,
+        )
+        unversioned_labels = list(dict.fromkeys(
+            str(item["label"]) for item in conditions if not item["versions"]
+        ))
+        if highest_version:
+            version_labels = {
+                version: str(item["label"])
+                for item in conditions
+                for version in item["versions"]
+            }
+            remaining = [number for number in range(1, highest_version + 1) if number not in version_labels]
+            for label, number in zip(unversioned_labels, remaining, strict=False):
+                version_labels[number] = label
+            concepts = [
+                {
+                    "id": f"concept-{number}",
+                    "label": (
+                        f"{version_labels[number]} (v{number})"
+                        if sum(1 for value in version_labels.values() if value == version_labels[number]) > 1
+                        else version_labels[number]
+                    ),
+                    "aliases": [version_labels[number], f"v{number}"],
+                }
+                for number in sorted(version_labels)
+            ]
+        else:
+            concepts = [
+                {"id": f"concept-{index}", "label": label, "aliases": [label]}
+                for index, label in enumerate(unversioned_labels, start=1)
+            ]
+
+    question_targets: dict[str, list[str]] = {}
+    for item in conditions:
+        target_ids: list[str] = []
+        versions = item["versions"]
+        if versions:
+            target_ids = [f"concept-{version}" for version in versions]
+        else:
+            label_key = normalize_text(str(item["label"]))
+            ranked = sorted(
+                (
+                    (text_similarity(label_key, normalize_text(str(concept["label"]))), str(concept["id"]))
+                    for concept in concepts
+                ),
+                reverse=True,
+            )
+            if ranked and ranked[0][0] >= 0.45:
+                target_ids = [ranked[0][1]]
+        if target_ids:
+            question_targets[str(item["question_id"])] = target_ids
+
+    direct_question_targets = {
+        question_id: list(target_ids)
+        for question_id, target_ids in question_targets.items()
+    }
+
+    by_id = {question.id: question for question in questions}
+    for question_id, target_ids in question_targets.items():
+        if question_id in by_id:
+            by_id[question_id].concept_ids = target_ids
+    # If a question is filtered by an already concept-specific controller,
+    # it belongs to the same concepts (for example Q7 depends on Q6.2).
+    changed = True
+    while changed:
+        changed = False
+        for question in questions:
+            if question.concept_ids:
+                continue
+            inherited = list(dict.fromkeys(
+                concept_id
+                for rule in question.display_rules
+                if rule.condition
+                for atom in rule.condition.atoms
+                for concept_id in by_id.get(atom.question_id, question).concept_ids
+                if atom.question_id in by_id
+            ))
+            if inherited:
+                question.concept_ids = inherited
+                question_targets[question.id] = inherited
+                changed = True
+
+    return {
+        "concepts": concepts,
+        "concept_question_ids": question_targets,
+        "direct_concept_question_ids": direct_question_targets,
+        "dynamic_concept_question_ids": list(dict.fromkeys(dynamic_ids)),
+        "concept_rotation_text": rotation_text,
+    }
+
+
 def _infer_type(context: str, has_options: bool) -> QuestionType:
     upper = context.upper().replace("Ё", "Е")
     if "ИНФОБЛОК" in upper or "ВВОДНЫЙ ТЕКСТ" in upper:
@@ -401,17 +576,108 @@ def _positional_matrix_answers(
     return [], []
 
 
+def _coded_table_answers(rows: list[Block]) -> list[AnswerOption]:
+    answers: list[AnswerOption] = []
+    for row in rows[1:]:
+        for answer in _answers_from_block(row):
+            if not any(item.code == answer.code and item.text == answer.text for item in answers):
+                answers.append(answer)
+    return answers
+
+
+def _sectioned_matrix_answers(
+    window: list[Block], ignored_table_ids: set[int] | None = None
+) -> tuple[list[AnswerOption], list[AnswerOption]]:
+    """Read matrices stored as separate coded ``Строки``/``Столбцы`` tables.
+
+    Research questionnaires often describe a matrix using two ordinary
+    two-column Word tables instead of drawing the respondent-facing grid.
+    Which table contains selectable answers depends on whether the instruction
+    says "one answer in each row" or "in each column".
+    """
+    ignored = ignored_table_ids or set()
+    groups: dict[int, list[tuple[int, Block]]] = {}
+    for index, block in enumerate(window):
+        if block.table_id is not None and block.table_id not in ignored:
+            groups.setdefault(block.table_id, []).append((index, block))
+
+    row_answers: list[AnswerOption] = []
+    column_answers: list[AnswerOption] = []
+    for entries in groups.values():
+        first_index = entries[0][0]
+        rows = [block for _, block in entries]
+        if len(rows) < 2:
+            continue
+        header = " ".join(rows[0].cells).upper().replace("Ё", "Е")
+        preceding = ""
+        for index in range(first_index - 1, -1, -1):
+            if window[index].kind == "paragraph":
+                preceding = window[index].text.upper().replace("Ё", "Е")
+                break
+        values = _coded_table_answers(rows)
+        if not values:
+            continue
+        if "СТРОК" in header or "СТРОК" in preceding:
+            row_answers = values
+        elif "СТОЛБ" in header or "СТОЛБ" in preceding or "ШКАЛ" in header:
+            column_answers = values
+
+    if not row_answers or not column_answers:
+        return [], []
+
+    context = " ".join(block.text for block in window).upper().replace("Ё", "Е")
+    row_codes = {answer.code for answer in row_answers}
+    column_codes = {answer.code for answer in column_answers}
+    exclusive_codes = _exclusive_codes([context])
+    if exclusive_codes & row_codes and not exclusive_codes & column_codes:
+        return row_answers, column_answers
+    if exclusive_codes & column_codes and not exclusive_codes & row_codes:
+        return column_answers, row_answers
+    # Code 99 in a multi matrix is normally the selectable "none" value.
+    # It is therefore an answer axis even when the Word instruction does not
+    # repeat the word "исключающий" (A8 in the Mojito questionnaire).
+    if "МАТРИЦ" in context and ("МНОЖ" in context or "НЕСКОЛЬК" in context):
+        if "99" in row_codes and "99" not in column_codes:
+            return row_answers, column_answers
+        if "99" in column_codes and "99" not in row_codes:
+            return column_answers, row_answers
+    if re.search(r"В\s+КАЖД\w*\s+СТОЛБ", context):
+        # Each displayed column is a repeated response unit.  Its selectable
+        # values are the Word rows; the Word columns identify those units.
+        return row_answers, column_answers
+    # The conventional layout: statements are rows and the scale is columns.
+    return column_answers, row_answers
+
+
 def _exclusive_codes(instructions: list[str]) -> set[str]:
     codes: set[str] = set()
     for instruction in instructions:
         upper = instruction.upper().replace("Ё", "Е")
         if "ИСКЛЮЧА" not in upper:
             continue
-        for match in re.finditer(r"(?:КОД(?:Ы)?\s*)?(\d{1,3})(?:\s*[-–—]\s*(\d{1,3}))?", upper):
-            start = int(match.group(1))
-            end = int(match.group(2) or start)
-            if 0 <= end - start <= 20:
-                codes.update(str(item) for item in range(start, end + 1))
+        for match in re.finditer(
+            r"\bКОД(?:Ы)?\s+(\d{1,3})(?=[^.!?]{0,100}\bИСКЛЮЧА)",
+            upper,
+        ):
+            codes.add(match.group(1))
+        for match in re.finditer(
+            r"\b(\d{1,3})\s*(?:«[^»]*»\s*)?(?:[-–—:]\s*)?ИСКЛЮЧА\w*",
+            upper,
+        ):
+            codes.add(match.group(1))
+        # Only numbers syntactically attached to the word "исключающий" are
+        # exclusivity markers.  Other numbers in the same instruction often
+        # describe rotation ("коды 1-7. Код 99 исключающий").
+        patterns = (
+            r"КОД(?:Ы)?\s+([\d\s,;/Ии\-–—]+?)\s*(?:[-–—:]\s*)?ИСКЛЮЧА\w*",
+            r"([\d\s,;/Ии\-–—]+?)\s*(?:[-–—:]\s*)?ИСКЛЮЧА\w*",
+            r"ИСКЛЮЧА\w*(?:\s+КОД(?:Ы)?)?\s*[:\-–—]?\s*([\d\s,;/Ии\-–—]+)",
+        )
+        fragments: list[str] = []
+        for pattern in patterns:
+            fragments.extend(match.group(1) for match in re.finditer(pattern, upper))
+        for fragment in fragments:
+            codes.update(parse_code_list(fragment))
     return codes
 
 
@@ -473,6 +739,34 @@ def _test_products(table_groups: dict[int, list[Block]]) -> list[dict[str, str]]
     return products
 
 
+def _piped_option_sources(
+    blocks: list[Block], question_positions: list[tuple[int, QuestionSpec]]
+) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for position, block in enumerate(blocks):
+        explicit = re.search(
+            rf"ДЛЯ\s+(?P<target>{QUESTION_ID_TOKEN})\s+"
+            rf"ПОКАЗАТЬ.+?ОТМЕЧЕНН\w*\s+В\s+(?P<source>{QUESTION_ID_TOKEN})",
+            block.text,
+            flags=re.I,
+        )
+        if explicit:
+            result[normalize_id(explicit.group("target"))] = normalize_id(explicit.group("source"))
+            continue
+        inherited = re.search(
+            rf"ПОКАЗЫВАТЬ?\s+(?:ТОЛЬКО\s+)?ОТВЕТЫ?\s+ВЫБРАНН\w*\s+В\s+"
+            rf"(?P<source>{QUESTION_ID_TOKEN})",
+            block.text,
+            flags=re.I,
+        )
+        if not inherited:
+            continue
+        previous = [question for qpos, question in question_positions if qpos < position]
+        if previous:
+            result[previous[-1].id] = normalize_id(inherited.group("source"))
+    return result
+
+
 class DocxSurveyParser:
     def parse(self, path: str | Path) -> SurveySpec:
         path = Path(path)
@@ -484,9 +778,14 @@ class DocxSurveyParser:
         for position, block in enumerate(blocks):
             parsed = _question_from_block(block)
             if parsed:
-                question_hits.append((position, parsed[0], parsed[1], None))
+                explicit_type = (
+                    QuestionType.INFO
+                    if re.fullmatch(r"INFO\d+", parsed[0], flags=re.I)
+                    else None
+                )
+                question_hits.append((position, parsed[0], parsed[1], explicit_type))
                 continue
-            info_text = _info_from_block(block)
+            info_text = _info_from_block(block) or _implicit_info_from_blocks(blocks, position)
             if info_text:
                 info_counter += 1
                 question_hits.append(
@@ -526,9 +825,9 @@ class DocxSurveyParser:
             )
             # First look for an explicit type in the wording/instructions;
             # only after that use the presence of options as a SINGLE fallback.
-            inferred_type = explicit_type or _infer_type(text, False)
+            inferred_type = explicit_type or _infer_type(local_context, False)
             if inferred_type == QuestionType.UNKNOWN:
-                inferred_type = _infer_type(local_context, False)
+                inferred_type = _infer_type(text, False)
             if inferred_type == QuestionType.UNKNOWN:
                 inferred_type = _infer_type(local_context, bool(options))
 
@@ -553,16 +852,21 @@ class DocxSurveyParser:
                     if value:
                         options.append(_make_answer(str(len(options) + 1), value))
 
-            positional_options, positional_rows = _positional_matrix_answers(window, ignored_table_ids)
-            if positional_rows:
+            matrix_options, matrix_rows_found = _sectioned_matrix_answers(window, ignored_table_ids)
+            if not matrix_rows_found:
+                matrix_options, matrix_rows_found = _positional_matrix_answers(window, ignored_table_ids)
+            if matrix_rows_found:
                 if inferred_type not in {QuestionType.MATRIX_SINGLE, QuestionType.MATRIX_MULTI}:
                     inferred_type = QuestionType.MATRIX_SINGLE
-                existing_by_code = {option.code: option for option in options}
-                ordered_options = [existing_by_code.get(option.code, option) for option in positional_options]
-                header_codes = {option.code for option in positional_options}
-                ordered_options.extend(option for option in options if option.code not in header_codes)
-                options = ordered_options
-                matrix_rows = positional_rows
+                options = matrix_options
+                matrix_rows = matrix_rows_found
+
+            # Matrix parsing may replace the initially collected flat table
+            # list, so apply exclusivity to the final selectable options.
+            exclusive_codes = _exclusive_codes(instructions)
+            for option in options:
+                if option.code in exclusive_codes:
+                    option.exclusive = True
             seen_ids[qid] = seen_ids.get(qid, 0) + 1
             if seen_ids[qid] > 1:
                 warnings.append(f"Код вопроса {qid} встречается несколько раз; возможно, это цикл или блок по концептам.")
@@ -666,6 +970,8 @@ class DocxSurveyParser:
                 continue
             block_rules = parse_logic_rules(block.text, source_block=block.index)
             for rule in block_rules:
+                if re.search(r"ПОКАЗЫВАТЬ?\s+ОТВЕТЫ?\s+ВЫБРАНН", rule.raw_text, re.I):
+                    continue
                 # Quotas are deliberately outside the scope of this checker.
                 # A sentence such as "иначе завершить. Поставить квоты..." may
                 # leave a condition-less fragment after instruction splitting;
@@ -679,31 +985,70 @@ class DocxSurveyParser:
                     continue
 
                 if not rule.target_question_id and rule.action in {"show", "hide"}:
-                    next_questions = [question for qpos, question in question_positions if qpos > position]
-                    if next_questions:
-                        rule.target_question_id = next_questions[0].id
+                    use_previous = bool(
+                        re.match(
+                            r"^\s*(?:НЕ\s+)?ПОКАЗЫВАТЬ?\s+ТОЛЬКО\s+ЕСЛИ\b",
+                            rule.raw_text,
+                            flags=re.I,
+                        )
+                    )
+                    nearby = [
+                        question
+                        for qpos, question in question_positions
+                        if (qpos < position if use_previous else qpos > position)
+                    ]
+                    if nearby:
+                        rule.target_question_id = nearby[-1 if use_previous else 0].id
                         rule.confidence = min(rule.confidence, 0.82)
-                if rule.condition is None and "ЕСЛИ" in rule.raw_text.upper():
+                condition_words = rule.raw_text.upper().replace("Ё", "Е")
+                if rule.condition is None and (
+                    "ЕСЛИ" in condition_words
+                    or re.search(r"ПРИ\s+КОД", condition_words)
+                ):
                     previous_questions = [question for qpos, question in question_positions if qpos < position]
                     code_match = re.search(
-                        r"ЕСЛИ\s+(?P<negative>НЕ\s+)?(?:ОТМЕЧЕНЫ?|ВЫБРАНЫ?|ВЫБРАН\s+ОДИН\s+ИЗ)\s+"
-                        r"КОД(?:А|Ы|ОВ)?\s+(?P<codes>[\d\s,;–—-]+)",
+                        r"(?:ЕСЛИ\s+)?(?P<negative>НЕ\s+)?"
+                        r"(?:(?:ОТМЕЧЕНЫ?|ВЫБРАНЫ?|ВЫБРАН\s+ОДИН\s+ИЗ)\s+)?"
+                        r"(?:ТОЛЬКО\s+)?ПРИ?\s*КОД(?:Е|А|Ы|ОВ)?\s+(?P<codes>[\d\s,;–—-]+)"
+                        r"|ЕСЛИ\s+(?P<negative_alt>НЕ\s+)?(?:ОТМЕЧЕНЫ?|ВЫБРАНЫ?|ВЫБРАН\s+ОДИН\s+ИЗ)\s+"
+                        r"КОД(?:А|Ы|ОВ)?\s+(?P<codes_alt>[\d\s,;–—-]+)",
                         rule.raw_text,
                         flags=re.I,
                     )
-                    explicit_codes = re.findall(r"КОД(?:А|Ы|ОВ)?\s*(\d+)", rule.raw_text, flags=re.I)
+                    loose_match = re.search(
+                        r"КОД(?:Е|А|Ы|ОВ)?\s+([\d\s,;–—-]+)",
+                        rule.raw_text,
+                        flags=re.I,
+                    )
+                    loose_codes = (
+                        parse_code_list(loose_match.group(1).rstrip(" -–—"))
+                        if loose_match else []
+                    )
+                    explicit_codes = list(dict.fromkeys(
+                        loose_codes
+                        + re.findall(r"КОД(?:Е|А|Ы|ОВ)?\s*(\d+)", rule.raw_text, flags=re.I)
+                    ))
                     if previous_questions and (code_match or explicit_codes):
                         from .models import ConditionAtom, ConditionGroup
-                        from .normalization import parse_code_list
-
-                        values = parse_code_list(code_match.group("codes")) if code_match else explicit_codes
+                        raw_codes = (
+                            (code_match.group("codes") or code_match.group("codes_alt"))
+                            if code_match else ""
+                        )
+                        values = list(dict.fromkeys(
+                            (parse_code_list(raw_codes.rstrip(" -–—")) if raw_codes else [])
+                            + explicit_codes
+                        ))
                         if values:
                             rule.condition = ConditionGroup(
                                 combinator="and",
                                 atoms=[
                                     ConditionAtom(
                                         question_id=previous_questions[-1].id,
-                                        operator="not_in" if code_match and code_match.group("negative") else "in",
+                                        operator=(
+                                            "not_in"
+                                            if code_match and (code_match.group("negative") or code_match.group("negative_alt"))
+                                            else "in"
+                                        ),
                                         values=values,
                                     )
                                 ],
@@ -717,6 +1062,13 @@ class DocxSurveyParser:
                 if rule.condition is None and "ЕСЛИ" in rule.raw_text.upper():
                     warnings.append(f"Не удалось однозначно разобрать условие: {rule.raw_text}")
 
+        concept_metadata = _concept_metadata(blocks, questions, question_positions)
+        if concept_metadata.get("concepts"):
+            warnings = [
+                warning
+                for warning in warnings
+                if "ЕСЛИ тестируется" not in warning
+            ]
         if not questions:
             warnings.append("В документе не найдено ни одного вопроса с кодом.")
         return SurveySpec(
@@ -730,18 +1082,7 @@ class DocxSurveyParser:
                 "struck_or_deleted_fragments_ignored": True,
                 "ignored_technical_table_ids": sorted(ignored_table_ids),
                 "test_products": _test_products(table_groups),
-                "piped_options": {
-                    normalize_id(match.group("target")): normalize_id(match.group("source"))
-                    for block in blocks
-                    for match in [
-                        re.search(
-                            rf"ДЛЯ\s+(?P<target>{QUESTION_ID_TOKEN})\s+"
-                            rf"ПОКАЗАТЬ.+?ОТМЕЧЕНН\w*\s+В\s+(?P<source>{QUESTION_ID_TOKEN})",
-                            block.text,
-                            flags=re.I,
-                        )
-                    ]
-                    if match
-                },
+                "piped_options": _piped_option_sources(blocks, question_positions),
+                **concept_metadata,
             },
         )
