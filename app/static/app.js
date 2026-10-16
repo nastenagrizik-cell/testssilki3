@@ -62,6 +62,11 @@ async function poll(jobId) {
   for (;;) {
     const response = await fetch(`/api/jobs/${jobId}`);
     const job = await response.json();
+    if (response.status === 404) {
+      const error = new Error(job.detail || "Сервер потерял временное задание");
+      error.jobWasLost = true;
+      throw error;
+    }
     if (!response.ok) throw new Error(job.detail || "Не удалось получить статус");
     stage.textContent = job.stage;
     if (job.status === "completed") return renderReport(jobId, job.result);
@@ -78,16 +83,28 @@ form.addEventListener("submit", async (event) => {
   progressPanel.classList.remove("hidden");
   stage.textContent = "Загрузка анкеты";
   try {
-    const data = new FormData(form);
-    data.set("run_logic", form.elements.run_logic.checked ? "true" : "false");
-    data.set(
-      "allow_platform_demographics",
-      form.elements.allow_platform_demographics.checked ? "true" : "false",
-    );
-    const response = await fetch("/api/jobs", { method: "POST", body: data });
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.detail || "Не удалось запустить проверку");
-    await poll(payload.job_id);
+    // The selected File remains available in the form while this page stays
+    // open, so after one Render restart we can safely submit the same audit
+    // again without asking the user to choose the document a second time.
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const data = new FormData(form);
+      data.set("run_logic", form.elements.run_logic.checked ? "true" : "false");
+      data.set(
+        "allow_platform_demographics",
+        form.elements.allow_platform_demographics.checked ? "true" : "false",
+      );
+      const response = await fetch("/api/jobs", { method: "POST", body: data });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || "Не удалось запустить проверку");
+      try {
+        await poll(payload.job_id);
+        return;
+      } catch (error) {
+        if (!error.jobWasLost || attempt > 0) throw error;
+        stage.textContent = "Сервер перезапустился — автоматически запускаем проверку заново";
+        await new Promise(resolve => setTimeout(resolve, 5000));
+      }
+    }
   } catch (error) {
     showError(error.message || String(error));
   }
